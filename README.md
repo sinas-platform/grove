@@ -94,5 +94,3 @@ package/             Sinas Package YAML (sinas-grove.yaml) and skills
 Dockerfile           Single-image build (multi-stage)
 docker-compose.yml   Local dev environment
 ```
-
-See `ARCHITECTURE.md` for the detailed v1 spec.
