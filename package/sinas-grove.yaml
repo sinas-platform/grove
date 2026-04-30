@@ -1,0 +1,1161 @@
+apiVersion: sinas.co/v1
+kind: SinasPackage
+metadata:
+  name: sinas-grove
+  description: >
+    Multi-agent document indexing and retrieval. Installs the Grove connector,
+    document ingestion collection, post-upload function, and the 13 Grove
+    agents (ingestion, retrieval, synthesis).
+
+package:
+  name: sinas-grove
+  version: "0.1.6"
+  description: >
+    Sinas Grove — stateful, multi-agent document indexing and retrieval. The
+    runtime is generic; domain knowledge (document classes, properties,
+    entity/relationship types, dossiers, playbooks) is configured in the Grove
+    backend and discovered by agents at runtime via the connector.
+  author: Sinas Grove contributors
+  url: https://github.com/sinas-platform/sinas-grove
+
+spec:
+  # ─────────────────────────────────────────────
+  # Function-runtime Python dependencies — installed by Sinas on worker
+  # rebuild. The post-upload function uses MarkItDown to convert arbitrary
+  # uploads (docx, pdf, html, xlsx, pptx, …) to markdown.
+  # ─────────────────────────────────────────────
+  dependencies:
+    # `[all]` extra pulls in pdfminer, python-docx, openpyxl, python-pptx,
+    # mammoth, etc. — needed for the converters to handle PDF/Office formats.
+    - packageName: markitdown[all]
+      version: ">=0.0.1a3"
+
+  # ─────────────────────────────────────────────
+  # Install-time variables — prompted for by the package installer
+  # ─────────────────────────────────────────────
+  variables:
+    - name: GROVE_URL
+      type: text
+      description: >
+        Base URL where Grove's HTTP API is reachable from inside the Sinas
+        containers. For local docker-compose this is http://host.docker.internal:8080.
+        For deployed environments, the public/internal URL of the Grove service.
+      example: https://grove.example.com
+      required: true
+
+    - name: PRIMARY_LLM
+      type: resource_ref
+      resource: llm_providers
+      description: >
+        LLM provider used by the capable / mid-tier agents — orchestration,
+        deep search, relationship discovery, synthesis, and faithfulness
+        validation. Should point at a provider configured for a strong reasoning
+        model (e.g. Claude Sonnet).
+      required: true
+
+    - name: CHEAP_LLM
+      type: resource_ref
+      resource: llm_providers
+      description: >
+        LLM provider used by the cost-tiered ingestion enrichers — classifier,
+        summarizer, property extractor, entity extractor, relationship extractor,
+        dossier assigner, and process validation. Should point at a provider
+        configured for a fast / cheap model (e.g. Claude Haiku).
+      required: true
+
+  # ─────────────────────────────────────────────
+  # Collection — uploads here trigger ingestion
+  # ─────────────────────────────────────────────
+  collections:
+    - namespace: grove
+      name: documents
+      description: Documents indexed by Grove. Upload here to trigger ingestion.
+      metadataSchema:
+        type: object
+        properties:
+          source:
+            type: string
+            description: Where the document came from (manual, api, batch, s3, sftp)
+          dossier_id:
+            type: string
+            description: Optional — assign on upload to a known dossier
+          dossier_path_hint:
+            type: string
+            description: Optional — string the dossier_assigner_agent can use
+        additionalProperties: true
+      maxFileSizeMb: 50
+      maxTotalSizeGb: 50
+      postUploadFunction: grove/post_upload
+
+  # ─────────────────────────────────────────────
+  # Connector — wraps the Grove HTTP API
+  # ─────────────────────────────────────────────
+  connectors:
+    - namespace: grove
+      name: api
+      description: >
+        HTTP API of the Sinas Grove backend. Agents call these operations to
+        introspect the domain model, read document content, and write
+        ingestion / retrieval / synthesis artifacts.
+      baseUrl: ${{ vars.GROVE_URL }}
+      # `sinas_token` forwards the calling user's Sinas token. Grove validates
+      # it via Sinas's /auth/me endpoint to resolve the user's identity and
+      # roles for owner/roles enforcement. No shared API key is needed.
+      auth:
+        type: sinas_token
+      operations:
+        # ── configuration introspection ──
+        - name: get_document_classes
+          method: GET
+          path: /api/v1/config/document-classes
+          description: List all document classes with descriptions and classification hints.
+
+        - name: get_document_class_properties
+          method: GET
+          path: /api/v1/config/document-classes/{{ class_id }}/properties
+          parameters:
+            type: object
+            properties:
+              class_id: { type: string, format: uuid }
+            required: [class_id]
+          description: Get the property schema for a document class.
+
+        - name: get_entity_types_for_class
+          method: GET
+          path: /api/v1/config/document-classes/{{ class_id }}/entity-types
+          parameters:
+            type: object
+            properties:
+              class_id: { type: string, format: uuid }
+            required: [class_id]
+          description: Entity types attached to a document class.
+
+        - name: get_entity_types
+          method: GET
+          path: /api/v1/config/entity-types
+          description: All entity types in the deployment.
+
+        - name: get_relationship_definitions
+          method: GET
+          path: /api/v1/config/relationship-definitions
+          description: All relationship definitions.
+
+        - name: get_dossier_classes
+          method: GET
+          path: /api/v1/config/dossier-classes
+          description: List dossier classes (empty if dossiers not configured).
+
+        - name: get_dossier_class_properties
+          method: GET
+          path: /api/v1/config/dossier-classes/{{ class_id }}/properties
+          parameters:
+            type: object
+            properties:
+              class_id: { type: string, format: uuid }
+            required: [class_id]
+
+        - name: find_candidate_dossiers
+          method: GET
+          path: /api/v1/dossiers
+          parameters:
+            type: object
+            properties:
+              dossier_class_id: { type: string, format: uuid }
+
+        # ── content access ──
+        - name: get_document
+          method: GET
+          path: /api/v1/documents/{{ doc_id }}
+          parameters:
+            type: object
+            properties:
+              doc_id: { type: string, format: uuid }
+            required: [doc_id]
+
+        - name: read_document_content
+          method: GET
+          path: /api/v1/documents/{{ doc_id }}/versions/{{ version }}/content
+          parameters:
+            type: object
+            properties:
+              doc_id: { type: string, format: uuid }
+              version: { type: integer }
+              line_from: { type: integer }
+              line_to: { type: integer }
+            required: [doc_id, version]
+
+        - name: get_property_values
+          method: GET
+          path: /api/v1/documents/{{ doc_id }}/property-values
+          parameters:
+            type: object
+            properties:
+              doc_id: { type: string, format: uuid }
+            required: [doc_id]
+
+        - name: list_dossier_documents
+          method: GET
+          path: /api/v1/dossiers/{{ dossier_id }}/documents
+          parameters:
+            type: object
+            properties:
+              dossier_id: { type: string, format: uuid }
+            required: [dossier_id]
+
+        # ── ingestion writes ──
+        - name: set_document_class
+          method: POST
+          path: /api/v1/ingest/documents/{{ doc_id }}/class
+          parameters:
+            type: object
+            properties:
+              doc_id: { type: string, format: uuid }
+              document_class_id: { type: string, format: uuid }
+              confidence: { type: number }
+              reason: { type: string }
+            required: [doc_id, document_class_id]
+
+        - name: set_document_summary
+          method: POST
+          path: /api/v1/ingest/documents/{{ doc_id }}/summary
+          parameters:
+            type: object
+            properties:
+              doc_id: { type: string, format: uuid }
+              summary: { type: string }
+              toc: { type: object }
+            required: [doc_id, summary]
+
+        - name: set_property_value
+          method: POST
+          path: /api/v1/ingest/property-values
+          parameters:
+            type: object
+            properties:
+              property_id: { type: string, format: uuid }
+              document_id: { type: string, format: uuid }
+              document_version_id: { type: string, format: uuid }
+              value: {}
+              source_span: { type: object }
+              method: { type: string, enum: [auto, manual] }
+              confidence: { type: number }
+              reason: { type: string }
+            required: [property_id, document_id, value]
+
+        - name: propose_new_entity
+          method: POST
+          path: /api/v1/ingest/entities
+          parameters:
+            type: object
+            properties:
+              entity_type_id: { type: string, format: uuid }
+              canonical_form: { type: string }
+              extra_metadata: { type: object }
+            required: [entity_type_id, canonical_form]
+
+        - name: record_entity_mention
+          method: POST
+          path: /api/v1/ingest/entity-mentions
+          parameters:
+            type: object
+            properties:
+              document_id: { type: string, format: uuid }
+              document_version_id: { type: string, format: uuid }
+              entity_id: { type: string, format: uuid }
+              span: { type: object }
+              confidence: { type: number }
+            required: [document_id, entity_id, span]
+
+        - name: record_relationship
+          method: POST
+          path: /api/v1/ingest/relationships
+          parameters:
+            type: object
+            properties:
+              relationship_definition_id: { type: string, format: uuid }
+              source_id: { type: string, format: uuid }
+              target_id: { type: string, format: uuid }
+              current_state_id: { type: string, format: uuid }
+              evidence_document_id: { type: string, format: uuid }
+              evidence_span: { type: object }
+              confidence: { type: number }
+              notes: { type: string }
+            required: [relationship_definition_id, source_id, target_id]
+
+        - name: propose_relationship
+          method: POST
+          path: /api/v1/ingest/relationship-proposals
+          parameters:
+            type: object
+            properties:
+              relationship_definition_id: { type: string, format: uuid }
+              source_id: { type: string, format: uuid }
+              target_id: { type: string, format: uuid }
+              suggested_state_id: { type: string, format: uuid }
+              proposing_agent: { type: string }
+              reasoning: { type: string }
+              evidence_document_id: { type: string, format: uuid }
+              evidence_span: { type: object }
+              confidence: { type: number }
+            required: [relationship_definition_id, source_id, target_id]
+
+        - name: assign_dossier
+          method: POST
+          path: /api/v1/dossiers/{{ dossier_id }}/documents
+          parameters:
+            type: object
+            properties:
+              dossier_id: { type: string, format: uuid }
+              document_id: { type: string, format: uuid }
+              role: { type: string }
+            required: [dossier_id, document_id]
+
+        - name: propose_new_dossier
+          method: POST
+          path: /api/v1/dossiers
+          parameters:
+            type: object
+            properties:
+              dossier_class_id: { type: string, format: uuid }
+              name: { type: string }
+              status: { type: string }
+            required: [dossier_class_id, name]
+
+        # ── retrieval ──
+        - name: introspect
+          method: POST
+          path: /api/v1/retrieval/introspect
+          parameters:
+            type: object
+            properties:
+              filter: { type: object }
+              fields:
+                type: array
+                items: { type: string }
+              top_k: { type: integer }
+
+        - name: create_draft_result
+          method: POST
+          path: /api/v1/retrieval/results
+          parameters:
+            type: object
+            properties:
+              query: { type: string }
+              invoked_skill_names:
+                type: array
+                items: { type: string }
+              parent_result_id: { type: string, format: uuid }
+            required: [query]
+
+        - name: add_files_to_result
+          method: POST
+          path: /api/v1/retrieval/results/{{ result_id }}/files
+          parameters:
+            type: object
+            properties:
+              result_id: { type: string, format: uuid }
+              document_ids:
+                type: array
+                items: { type: string, format: uuid }
+              reason: { type: string }
+              added_by_agent: { type: string }
+            required: [result_id, document_ids]
+
+        - name: append_trace
+          method: POST
+          path: /api/v1/retrieval/results/{{ result_id }}/trace
+          parameters:
+            type: object
+            properties:
+              result_id: { type: string, format: uuid }
+              sequence: { type: integer }
+              agent: { type: string }
+              action: { type: string }
+              parameters: { type: object }
+              outcome: { type: object }
+            required: [result_id, sequence, agent, action]
+
+        - name: publish_result
+          method: POST
+          path: /api/v1/retrieval/results/{{ result_id }}/publish
+          parameters:
+            type: object
+            properties:
+              result_id: { type: string, format: uuid }
+            required: [result_id]
+
+        - name: get_result
+          method: GET
+          path: /api/v1/results/{{ result_id }}
+          parameters:
+            type: object
+            properties:
+              result_id: { type: string, format: uuid }
+            required: [result_id]
+
+        - name: get_result_documents
+          method: GET
+          path: /api/v1/results/{{ result_id }}/documents
+          parameters:
+            type: object
+            properties:
+              result_id: { type: string, format: uuid }
+            required: [result_id]
+
+        - name: get_relationships
+          method: GET
+          path: /api/v1/relationships
+          parameters:
+            type: object
+            properties:
+              relationship_definition_id: { type: string, format: uuid }
+              source_id: { type: string, format: uuid }
+              target_id: { type: string, format: uuid }
+
+        # ── synthesis ──
+        - name: start_answer
+          method: POST
+          path: /api/v1/synthesis/answers
+          parameters:
+            type: object
+            properties:
+              question: { type: string }
+              source_result_id: { type: string, format: uuid }
+              source_dossier_id: { type: string, format: uuid }
+            required: [question]
+
+        - name: draft_claim
+          method: POST
+          path: /api/v1/synthesis/answers/{{ answer_id }}/claims
+          parameters:
+            type: object
+            properties:
+              answer_id: { type: string, format: uuid }
+              sequence: { type: integer }
+              claim_text: { type: string }
+              claim_type: { type: string }
+            required: [answer_id, sequence, claim_text]
+
+        - name: bind_evidence
+          method: POST
+          path: /api/v1/synthesis/claims/{{ claim_id }}/evidence
+          parameters:
+            type: object
+            properties:
+              claim_id: { type: string, format: uuid }
+              document_id: { type: string, format: uuid }
+              document_version_id: { type: string, format: uuid }
+              span: { type: object }
+              stance: { type: string, enum: [supports, contradicts, qualifies] }
+              relevance: { type: number }
+            required: [claim_id, document_id, span]
+
+        - name: record_validation_verdict
+          method: POST
+          path: /api/v1/synthesis/evidence/{{ evidence_id }}/verdict
+          parameters:
+            type: object
+            properties:
+              evidence_id: { type: string, format: uuid }
+              validated: { type: boolean }
+              reasoning: { type: string }
+            required: [evidence_id, validated, reasoning]
+
+        - name: publish_answer
+          method: POST
+          path: /api/v1/synthesis/answers/{{ answer_id }}/publish
+          parameters:
+            type: object
+            properties:
+              answer_id: { type: string, format: uuid }
+            required: [answer_id]
+
+  # ─────────────────────────────────────────────
+  # Function — post-upload hook on grove/documents
+  # ─────────────────────────────────────────────
+  functions:
+    - namespace: grove
+      name: post_upload
+      description: >
+        Invoked by Sinas after a file is uploaded to the grove/documents
+        collection. Registers the document with Grove and dispatches the
+        ingestion_coordinator agent.
+      sharedPool: true
+      timeout: 120
+      inputSchema:
+        type: object
+        properties:
+          file_id: { type: string }
+          namespace: { type: string }
+          collection: { type: string }
+          filename: { type: string }
+          version: { type: integer }
+          file_path: { type: string }
+          user_id: { type: string }
+          metadata: { type: object }
+      code: |
+        import base64
+        import os
+        import tempfile
+        from pathlib import Path
+
+        import requests
+        from markitdown import MarkItDown
+
+        SINAS_URL = os.environ.get("SINAS_URL", "http://host.docker.internal:8000")
+        GROVE_URL = os.environ.get("GROVE_URL", "http://host.docker.internal:8080")
+
+        def handler(input_data, context):
+            token = context["access_token"]
+            sinas_headers = {"Authorization": f"Bearer {token}"}
+            namespace = input_data["namespace"]
+            collection = input_data["collection"]
+            filename = input_data["filename"]
+
+            # 1. Pull the raw file from Sinas
+            resp = requests.get(
+                f"{SINAS_URL}/files/{namespace}/{collection}/{filename}",
+                headers=sinas_headers,
+                timeout=60,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            raw = base64.b64decode(payload["content_base64"])
+
+            # 2. Convert to markdown — MarkItDown handles docx, pdf, html,
+            #    xlsx, pptx, csv, and many more. Falls back to None on any
+            #    failure; Grove still registers the document, and a later
+            #    extraction agent can retry.
+            content_md = None
+            extraction_error = None
+            suffix = Path(filename).suffix or ""
+            try:
+                with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+                    tmp.write(raw)
+                    tmp_path = tmp.name
+                try:
+                    result = MarkItDown().convert(tmp_path)
+                    content_md = result.text_content
+                finally:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+            except Exception as exc:
+                extraction_error = f"{type(exc).__name__}: {exc}"
+                print(f"[grove/post_upload] markitdown failed for {filename}: {extraction_error}")
+                content_md = None
+            else:
+                if not content_md:
+                    print(
+                        f"[grove/post_upload] markitdown produced empty content for {filename}"
+                    )
+
+            # 3. Register the document with Grove (idempotent on collection_file_id)
+            grove_headers = {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            }
+            register = requests.post(
+                f"{GROVE_URL}/api/v1/ingest/post-upload",
+                json={
+                    "collection_file_id": input_data["file_id"],
+                    "filename": filename,
+                    "content_md": content_md,
+                    "metadata": input_data.get("metadata") or {},
+                },
+                headers=grove_headers,
+                timeout=60,
+            )
+            register.raise_for_status()
+            registered = register.json()
+
+            # 3. Hand off to the ingestion_coordinator agent via Sinas's
+            #    synchronous /agents/{ns}/{name}/invoke endpoint. The
+            #    coordinator will fan out to the enrichment agents in
+            #    parallel; we wait for it to finish so any failure surfaces
+            #    here instead of disappearing silently.
+            invoke_body = {
+                "message": (
+                    f"Ingest document {registered['document_id']} "
+                    f"(version {registered['version']}). "
+                    f"Filename: {filename}. "
+                    "Run the full ingestion pipeline."
+                ),
+                "input": {
+                    "document_id": registered["document_id"],
+                    "document_version_id": registered["document_version_id"],
+                    "version": registered["version"],
+                    "upload_metadata": input_data.get("metadata") or {},
+                },
+            }
+            invoke = requests.post(
+                f"{SINAS_URL}/agents/grove/ingestion-coordinator/invoke",
+                json=invoke_body,
+                headers=sinas_headers,
+                timeout=600,  # ingestion fan-out can take a while
+            )
+            invoke.raise_for_status()
+            invoke_result = invoke.json()
+            return {
+                "registered": True,
+                "document_id": registered["document_id"],
+                "document_version_id": registered["document_version_id"],
+                "extracted_chars": len(content_md) if content_md else 0,
+                "extraction_error": extraction_error,
+                "agent_chat_id": invoke_result.get("chat_id"),
+                "agent_reply": invoke_result.get("reply"),
+            }
+
+  # ─────────────────────────────────────────────
+  # Skills — placeholder retrieval/synthesis playbooks
+  # (deployments author their own; these exist so wildcard
+  # enabledSkills match something out of the box)
+  # ─────────────────────────────────────────────
+  skills:
+    - namespace: grove_retrieval_playbooks
+      name: default
+      description: >
+        Default retrieval playbook. Use when no domain-specific playbook is
+        configured. Iteratively narrow candidates via introspect-then-filter,
+        validate sufficiency, then publish.
+      preload: false
+      content: |
+        # Default retrieval playbook
+
+        ## Question patterns
+        - Open-ended document discovery without a calibrated domain playbook.
+
+        ## Stop conditions
+        - Fewer than ~25 candidates remain AND every candidate's class hints
+          plus property summary suggests it could be relevant.
+        - Or: introspect shows no further filter discriminates the set
+          meaningfully.
+
+        ## Validation checklist
+        - The query's intent is satisfied by at least one candidate's summary.
+        - No obvious top-population-but-irrelevant document is included.
+        - Candidates span the question's scope (e.g. multiple jurisdictions
+          if the question is comparative).
+
+    - namespace: grove_synthesis_playbooks
+      name: default
+      description: >
+        Default synthesis playbook. Produces a structured prose answer with
+        inline citations to claim evidence.
+      preload: false
+      content: |
+        # Default synthesis playbook
+
+        ## Question patterns
+        - Any factual or comparative question over a published result.
+
+        ## Output structure
+        1. Direct answer (1-2 sentences)
+        2. Supporting reasoning, structured by sub-question if relevant
+        3. List of caveats / edge cases the evidence does not cover
+
+        ## Citation conventions
+        - Every load-bearing factual claim must bind to at least one
+          claim_evidence row.
+        - Use stance=`supports` by default; use `qualifies` when the cited
+          span limits the claim; use `contradicts` only when explicitly
+          contrasting.
+
+  # ─────────────────────────────────────────────
+  # Agents — see ARCHITECTURE.md §5
+  # ─────────────────────────────────────────────
+  agents:
+    # ───────── ingestion ─────────
+    - namespace: grove
+      name: ingestion-coordinator
+      description: Orchestrates ingestion for a single document.
+      llmProviderName: ${{ vars.PRIMARY_LLM }}
+      temperature: 0.1
+      systemPrompt: |
+        You orchestrate Grove's document ingestion pipeline. You receive a
+        document_id (and version) for a freshly uploaded file. Your job is
+        to produce a fully indexed, queryable document.
+
+        Workflow:
+          1. Invoke the `classifier-agent` with the document_id. Wait for it
+             to assign a document_class.
+          2. In parallel, invoke:
+               - `summarizer-agent`
+               - `property-extractor-agent`
+               - `entity-extractor-agent`
+               - `relationship-extractor-agent`
+               - `dossier-assigner-agent` (only if `get_dossier_classes`
+                 returns non-empty)
+          3. If any enrichment agent fails, the document still becomes
+             queryable with that dimension missing. Log the failure in
+             your reply but do not block the others.
+          4. Reply with a summary of what was indexed.
+
+        Tools:
+          - grove/api: get_document_classes, get_dossier_classes (for the
+            dossier-or-not check)
+          - sub-agents listed above
+
+        Do not write to the document directly — that's the enrichment
+        agents' job.
+      enabledConnectors:
+        - connector: grove/api
+          operations: [get_document_classes, get_dossier_classes, get_document]
+      enabledAgents:
+        - grove/classifier-agent
+        - grove/summarizer-agent
+        - grove/property-extractor-agent
+        - grove/entity-extractor-agent
+        - grove/relationship-extractor-agent
+        - grove/dossier-assigner-agent
+
+    - namespace: grove
+      name: classifier-agent
+      description: Assigns a document_class_id; can propose a new class.
+      llmProviderName: ${{ vars.CHEAP_LLM }}
+      temperature: 0.0
+      systemPrompt: |
+        You classify a single document into one of the document classes
+        configured for this Grove deployment.
+
+        Workflow:
+          1. Call `get_document_classes` to see the available classes. Read
+             each class's description and `classification_hints` carefully —
+             this is where the admin tells you how to disambiguate.
+          2. Call `read_document_content` to read the first ~200 lines of
+             the document. Read more if classification is ambiguous.
+          3. Pick the best matching class. Call `set_document_class` with
+             your choice, a confidence score (0-1), and a one-line reason.
+          4. If no class is clearly appropriate, do NOT force a match —
+             explain in your reply and stop. (A future version will let you
+             propose a new class via `propose_new_document_class`.)
+
+        Domain knowledge lives in the class descriptions and hints. Do not
+        rely on prior assumptions about what kinds of documents exist.
+      enabledConnectors:
+        - connector: grove/api
+          operations:
+            - get_document_classes
+            - get_document
+            - read_document_content
+            - set_document_class
+
+    - namespace: grove
+      name: summarizer-agent
+      description: Produces document.summary and document.toc.
+      llmProviderName: ${{ vars.CHEAP_LLM }}
+      temperature: 0.0
+      systemPrompt: |
+        You write a concise summary and table of contents for a document.
+
+        Workflow:
+          1. Call `get_document` to see the assigned document class.
+          2. Call `get_document_classes` and find the class. Read its
+             `summarization_guidance` — this tells you what the summary
+             must emphasize for this class.
+          3. Call `read_document_content` to read the document.
+          4. Call `set_document_summary` with:
+               - `summary`: ~150 words, following the guidance
+               - `toc`: nested object reflecting the document structure
+
+        Be faithful. Do not invent details. If the document is too short
+        for a meaningful TOC, return `toc: {}`.
+      enabledConnectors:
+        - connector: grove/api
+          operations:
+            - get_document
+            - get_document_classes
+            - read_document_content
+            - set_document_summary
+
+    - namespace: grove
+      name: property-extractor-agent
+      description: Populates property_values for the document's class.
+      llmProviderName: ${{ vars.CHEAP_LLM }}
+      temperature: 0.0
+      systemPrompt: |
+        You extract structured properties from a document.
+
+        Workflow:
+          1. Call `get_document` to find the document_class_id.
+          2. Call `get_document_class_properties` to get the property
+             schemas, descriptions, and `guidance` for each.
+          3. For each property where `manual` is false:
+              a. Read the relevant document content via
+                 `read_document_content`. The property's `guidance` tells
+                 you where in the document to look.
+              b. Extract the value (matching the property's JSON schema).
+              c. Call `set_property_value` with:
+                  - the value
+                  - `source_span` indicating where you found it
+                  - `confidence` (0-1)
+                  - a short `reason`
+          4. If a required property cannot be found, set
+             `confidence: 0` and explain in `reason`.
+
+        Use the guidance literally. The admin authored it for this class
+        specifically; do not generalize.
+      enabledConnectors:
+        - connector: grove/api
+          operations:
+            - get_document
+            - get_document_class_properties
+            - read_document_content
+            - set_property_value
+
+    - namespace: grove
+      name: entity-extractor-agent
+      description: Records entity mentions; proposes new canonical entities.
+      llmProviderName: ${{ vars.CHEAP_LLM }}
+      temperature: 0.0
+      systemPrompt: |
+        You extract entity mentions from a document.
+
+        Workflow:
+          1. Call `get_document` to find the document_class_id.
+          2. Call `get_entity_types_for_class` to see which entity types
+             apply. Read each type's `guidance`.
+          3. Call `read_document_content`.
+          4. For each mention you find:
+              a. (Future: look up canonical entity via
+                 `get_known_entities` to dedupe.)
+              b. If new, call `propose_new_entity` to register a canonical
+                 form, then `record_entity_mention` linking the new entity
+                 to this document with the span.
+              c. If you've already seen the canonical form in this run,
+                 just call `record_entity_mention` with the existing id.
+
+        Be conservative. False mentions are worse than missed mentions —
+        downstream agents will rediscover important entities.
+      enabledConnectors:
+        - connector: grove/api
+          operations:
+            - get_document
+            - get_entity_types_for_class
+            - read_document_content
+            - propose_new_entity
+            - record_entity_mention
+
+    - namespace: grove
+      name: relationship-extractor-agent
+      description: Records relationships explicitly stated in the document.
+      llmProviderName: ${{ vars.CHEAP_LLM }}
+      temperature: 0.0
+      systemPrompt: |
+        You extract relationships explicitly stated in a document.
+
+        Workflow:
+          1. Call `get_document` and `get_relationship_definitions`. For
+             each definition, read its `extraction_guidance`.
+          2. For each definition where this document type can be a source
+             or target (per source_ref_type / target_ref_type):
+              a. Read the document via `read_document_content`.
+              b. For each relationship instance you find:
+                  - if confidence ≥ 0.8: call `record_relationship`
+                  - if confidence < 0.8: call `propose_relationship`
+                    (queues for human review)
+              c. Always include `evidence_document_id` and
+                 `evidence_span`.
+
+        Only extract relationships explicitly stated in the document.
+        Discovery — inferring relationships from broader research — is
+        the relationship_discovery_agent's job, not yours.
+      enabledConnectors:
+        - connector: grove/api
+          operations:
+            - get_document
+            - get_relationship_definitions
+            - read_document_content
+            - record_relationship
+            - propose_relationship
+
+    - namespace: grove
+      name: dossier-assigner-agent
+      description: Assigns documents to dossiers (only when dossiers configured).
+      llmProviderName: ${{ vars.CHEAP_LLM }}
+      temperature: 0.0
+      systemPrompt: |
+        You assign a document to one or more dossiers, or propose a new
+        dossier when warranted.
+
+        Workflow:
+          1. Call `get_dossier_classes`. If empty, do nothing — this
+             deployment has no dossiers configured.
+          2. Call `get_document` and `get_property_values` to see what's
+             already known about this document.
+          3. For each dossier class that could plausibly contain this
+             document:
+              a. Call `find_candidate_dossiers` with that class id.
+              b. Match against the candidates using the document's
+                 properties (matter id, parties, transaction reference,
+                 etc.) and the class's `classification_hints`.
+              c. If a clear match: call `assign_dossier` with a `role`
+                 (e.g. "primary_contract", "amendment", "correspondence").
+              d. If no match but the document strongly anchors a new
+                 dossier of this class: call `propose_new_dossier`.
+              e. Otherwise: skip.
+
+        Some documents are deployment-wide (policy memos, templates) and
+        belong to no dossier. That's a valid outcome — do not force a
+        match.
+      enabledConnectors:
+        - connector: grove/api
+          operations:
+            - get_dossier_classes
+            - get_dossier_class_properties
+            - get_document
+            - get_property_values
+            - find_candidate_dossiers
+            - assign_dossier
+            - propose_new_dossier
+
+    # ───────── retrieval ─────────
+    - namespace: grove
+      name: search-orchestrator
+      description: Decomposes queries; runs deep_search, merges results.
+      llmProviderName: ${{ vars.PRIMARY_LLM }}
+      temperature: 0.2
+      systemPrompt: |
+        You orchestrate retrieval for a user query.
+
+        Workflow:
+          1. Decide whether the query needs decomposition. Comparative
+             questions ("how does X differ between A and B") and questions
+             with multiple independent sub-questions usually do.
+          2. For each (sub)query, invoke `deep-search-agent`. Each
+             invocation runs the introspect-filter-validate loop and
+             produces a draft result.
+          3. After all sub-searches complete, merge their results into a
+             single parent result. Persist the parent's
+             `parent_result_id` linkage.
+          4. Append a final trace entry summarizing the orchestration.
+          5. Call `publish_result` on the parent.
+
+        Single-shot queries don't need decomposition — invoke
+        `deep-search-agent` once and publish its result directly.
+      enabledConnectors:
+        - connector: grove/api
+          operations:
+            - create_draft_result
+            - add_files_to_result
+            - append_trace
+            - publish_result
+            - get_result
+      enabledAgents:
+        - grove/deep-search-agent
+
+    - namespace: grove
+      name: deep-search-agent
+      description: Runs the introspect-filter-check loop; produces a draft result.
+      llmProviderName: ${{ vars.PRIMARY_LLM }}
+      temperature: 0.2
+      systemPrompt: |
+        You retrieve documents for a query by iteratively narrowing
+        candidates. You do NOT rely on semantic similarity alone — you
+        introspect field value distributions and apply structured filters.
+
+        Loop:
+          1. Call `introspect` with the current filter. Read the
+             distributions: which fields have small, discriminating
+             value sets? Which values match the query's intent?
+          2. Update the filter (the agent host maintains it across
+             iterations). Append a trace entry describing the change.
+          3. Repeat until either:
+               - the candidate set matches your playbook's stop
+                 conditions, OR
+               - introspect shows no further filter discriminates the
+                 set meaningfully
+          4. Invoke `process-validation-agent` to check the draft result
+             against the playbook criteria. If it passes, call
+             `add_files_to_result` and return. If not, refine and retry.
+          5. Optionally call `relationship-discovery-agent` to surface
+             additional relationships that might inform the user (the
+             discovery agent only writes proposals, never facts).
+
+        Always load applicable retrieval playbooks via the skill-loading
+        tool before starting. The playbook tells you the stop conditions
+        and validation criteria for this kind of question.
+
+        Domain knowledge is in playbooks — never hardcode strategy.
+      enabledConnectors:
+        - connector: grove/api
+          operations:
+            - introspect
+            - get_document
+            - get_property_values
+            - read_document_content
+            - get_relationships
+            - create_draft_result
+            - add_files_to_result
+            - append_trace
+            - publish_result
+      enabledSkills:
+        - skill: grove_retrieval_playbooks/*
+          preload: false
+      enabledAgents:
+        - grove/process-validation-agent
+        - grove/relationship-discovery-agent
+        - grove/deep-search-agent  # recursion for nested narrowing
+
+    - namespace: grove
+      name: process-validation-agent
+      description: Checks a draft result against playbook criteria.
+      llmProviderName: ${{ vars.CHEAP_LLM }}
+      temperature: 0.0
+      systemPrompt: |
+        You validate a draft result against a retrieval playbook's
+        sufficiency criteria.
+
+        Workflow:
+          1. Receive a result_id and the playbook name(s) the search
+             agent loaded.
+          2. Load the same playbook(s) via the skill-loading tool. Read
+             the validation checklist.
+          3. Call `get_result` and `get_result_documents` to inspect the
+             draft.
+          4. For each item on the playbook's checklist, judge: pass /
+             fail / cannot-determine. Be strict — false passes are worse
+             than false fails.
+          5. Reply with a verdict (`pass`, `fail`, `inconclusive`) and a
+             short reasoning per checklist item.
+
+        Do not modify the result yourself — your only output is the
+        verdict.
+      enabledConnectors:
+        - connector: grove/api
+          operations:
+            - get_result
+            - get_result_documents
+            - get_document
+            - get_property_values
+            - read_document_content
+      enabledSkills:
+        - skill: grove_retrieval_playbooks/*
+          preload: false
+
+    - namespace: grove
+      name: relationship-discovery-agent
+      description: Proposes new relationships based on research context.
+      llmProviderName: ${{ vars.PRIMARY_LLM }}
+      temperature: 0.3
+      systemPrompt: |
+        You propose new relationships between documents/entities based on
+        the research context of an active search.
+
+        Workflow:
+          1. Read the current result documents and existing relationships.
+          2. Call `get_relationship_definitions`. For each, read its
+             `discovery_guidance`.
+          3. For each definition, look for relationships not yet recorded
+             but supported by evidence in the result.
+          4. Call `propose_relationship` for each finding. ALWAYS include
+             `evidence_document_id`, `evidence_span`, and `reasoning`.
+             Set `proposing_agent: "relationship_discovery"`.
+
+        You write to `relationship_proposal` only — NEVER call
+        `record_relationship`. Proposed relationships go through human
+        review or auto-approval based on the deployment's confidence
+        threshold.
+      enabledConnectors:
+        - connector: grove/api
+          operations:
+            - get_relationship_definitions
+            - get_result
+            - get_result_documents
+            - get_document
+            - get_property_values
+            - read_document_content
+            - get_relationships
+            - propose_relationship
+
+    # ───────── synthesis ─────────
+    - namespace: grove
+      name: synthesis-agent
+      description: Drafts an answer with claim-bound evidence.
+      llmProviderName: ${{ vars.PRIMARY_LLM }}
+      temperature: 0.3
+      systemPrompt: |
+        You synthesize an answer to a question using evidence from a
+        published result (or, optionally, a dossier).
+
+        Workflow:
+          1. Receive: a question, plus either source_result_id or
+             source_dossier_id.
+          2. Call `start_answer` with the question and source.
+          3. Load the appropriate synthesis playbook via the
+             skill-loading tool. Pick the playbook whose
+             `question patterns` match this question.
+          4. Read the source's documents:
+               - result-driven: `get_result_documents`, then
+                 `get_document_summary`/`read_document_content` per
+                 document
+               - dossier-driven: `list_dossier_documents`, then read
+                 each
+          5. Draft claims one by one:
+               a. Call `draft_claim` with the next claim's text and
+                  type. Capture the returned claim_id.
+               b. For each piece of evidence supporting that claim,
+                  call `bind_evidence` with the document_id, version,
+                  and a precise span.
+               c. Use `stance: "qualifies"` when the cited span limits
+                  the claim, `"contradicts"` only when explicitly
+                  presenting contrasting evidence.
+          6. Invoke `faithfulness-validator-agent` on the answer.
+          7. If the validator passes all evidence, call
+             `publish_answer`. Otherwise, revise the offending claims
+             or evidence and revalidate.
+
+        Every load-bearing factual claim MUST have at least one
+        evidence binding. Do not invent claims unsupported by spans
+        in the source documents.
+      enabledConnectors:
+        - connector: grove/api
+          operations:
+            - start_answer
+            - draft_claim
+            - bind_evidence
+            - publish_answer
+            - get_result
+            - get_result_documents
+            - list_dossier_documents
+            - get_document
+            - read_document_content
+      enabledSkills:
+        - skill: grove_synthesis_playbooks/*
+          preload: false
+      enabledAgents:
+        - grove/faithfulness-validator-agent
+
+    - namespace: grove
+      name: faithfulness-validator-agent
+      description: Re-reads cited spans, verifies support, blocks bad publishes.
+      llmProviderName: ${{ vars.PRIMARY_LLM }}
+      temperature: 0.0
+      systemPrompt: |
+        You validate that every piece of evidence in an answer actually
+        supports the claim it's bound to.
+
+        Workflow:
+          1. Receive an answer_id.
+          2. For each claim:
+              a. Read the claim text.
+              b. For each evidence row bound to it:
+                  - call `read_document_content` (or read the span via
+                    a content read with line_from/line_to)
+                  - judge whether the span supports the claim with the
+                    declared stance
+                  - call `record_validation_verdict` with
+                    `validated: true`/`false` and a one-sentence
+                    reasoning.
+          3. Reply with a per-claim summary. Be strict: if a span only
+             tangentially relates to the claim, fail it.
+
+        Your verdict gates publishing. Do not be lenient — better to
+        send the synthesis_agent back for a revision than to publish a
+        weak citation.
+      enabledConnectors:
+        - connector: grove/api
+          operations:
+            - read_document_content
+            - record_validation_verdict
