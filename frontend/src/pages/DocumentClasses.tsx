@@ -48,7 +48,7 @@ const EMPTY = {
   summarization_guidance: '',
 };
 
-export default function DocumentClassesPage() {
+export default function DocumentClassesPage({ embedded = false }: { embedded?: boolean } = {}) {
   const qc = useQueryClient();
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
@@ -62,10 +62,24 @@ export default function DocumentClassesPage() {
 
   return (
     <div>
-      <PageHeader
-        title="Document classes"
-        description="Define the kinds of documents Grove indexes. Each class has its own properties and entity-extraction rules."
-        actions={
+      {!embedded && (
+        <PageHeader
+          title="Document classes"
+          description="Define the kinds of documents Grove indexes. Each class has its own properties and entity-extraction rules."
+          actions={
+            <PrimaryButton
+              onClick={() => {
+                setSelectedId(null);
+                setCreating(true);
+              }}
+            >
+              New class
+            </PrimaryButton>
+          }
+        />
+      )}
+      {embedded && (
+        <div className="mb-4 flex justify-end">
           <PrimaryButton
             onClick={() => {
               setSelectedId(null);
@@ -74,8 +88,8 @@ export default function DocumentClassesPage() {
           >
             New class
           </PrimaryButton>
-        }
-      />
+        </div>
+      )}
 
       <div className="grid grid-cols-12 gap-6">
         <div className="col-span-4 space-y-2">

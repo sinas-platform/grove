@@ -1,84 +1,66 @@
 import { NavLink, Outlet } from 'react-router-dom';
+import { Activity, FileText, MessageSquare, Network } from 'lucide-react';
 import { useAuth } from '@/lib/auth';
 
-const sections = [
-  {
-    heading: 'Library',
-    links: [
-      { to: '/documents', label: 'Documents' },
-      { to: '/results', label: 'Results' },
-      { to: '/answers', label: 'Answers' },
-    ],
-  },
-  {
-    heading: 'Configuration',
-    links: [
-      { to: '/config/document-classes', label: 'Document classes' },
-      { to: '/config/entity-types', label: 'Entity types' },
-      { to: '/config/relationships', label: 'Relationships' },
-      { to: '/config/dossier-classes', label: 'Dossier classes' },
-      { to: '/config/playbooks', label: 'Playbooks' },
-    ],
-  },
-  {
-    heading: 'Review',
-    links: [{ to: '/review/proposals', label: 'Proposals' }],
-  },
-  {
-    heading: 'System',
-    links: [{ to: '/sinas-status', label: 'Sinas integration' }],
-  },
+const links = [
+  { to: '/documents', label: 'Documents', icon: FileText },
+  { to: '/answers', label: 'Answers', icon: MessageSquare },
+  { to: '/schema', label: 'Schema', icon: Network },
+  { to: '/activity', label: 'Activity', icon: Activity },
 ];
 
 export function Layout() {
   const { me, signOut } = useAuth();
   return (
-    <div className="min-h-screen flex">
-      <aside className="w-64 border-r border-stone-200 bg-white px-4 py-6 flex flex-col">
-        <div className="px-2 mb-8">
-          <div className="text-lg font-semibold text-forest-700">Sinas Grove</div>
-          <div className="text-xs text-stone-500">v0.1</div>
+    <div className="min-h-screen flex bg-stone-50">
+      <aside className="w-60 border-r border-stone-200 bg-white flex flex-col">
+        <div className="px-5 pt-6 pb-8">
+          <div className="text-base font-semibold tracking-tight text-forest-700">
+            Sinas Grove
+          </div>
+          <div className="text-[11px] text-stone-400 uppercase tracking-wider mt-0.5">
+            alpha
+          </div>
         </div>
-        <div className="flex-1">
-          {sections.map((section) => (
-            <div key={section.heading} className="mb-6">
-              <div className="px-2 text-xs font-semibold uppercase tracking-wider text-stone-400 mb-2">
-                {section.heading}
-              </div>
-              <nav className="flex flex-col">
-                {section.links.map((link) => (
-                  <NavLink
-                    key={link.to}
-                    to={link.to}
-                    className={({ isActive }) =>
-                      `px-2 py-1.5 rounded text-sm ${
-                        isActive
-                          ? 'bg-forest-100 text-forest-700 font-medium'
-                          : 'text-stone-700 hover:bg-stone-100'
-                      }`
-                    }
-                  >
-                    {link.label}
-                  </NavLink>
-                ))}
-              </nav>
-            </div>
+        <nav className="flex-1 flex flex-col px-3 gap-0.5">
+          {links.map(({ to, label, icon: Icon }) => (
+            <NavLink
+              key={to}
+              to={to}
+              className={({ isActive }) =>
+                `flex items-center gap-3 px-3 py-2 rounded-md text-sm transition-colors ${
+                  isActive
+                    ? 'bg-forest-50 text-forest-700 font-medium'
+                    : 'text-stone-600 hover:text-stone-900 hover:bg-stone-100'
+                }`
+              }
+            >
+              <Icon size={16} strokeWidth={2} />
+              {label}
+            </NavLink>
           ))}
-        </div>
+        </nav>
         {me && (
-          <div className="px-2 pt-4 border-t border-stone-200 text-xs text-stone-500">
-            <div className="mb-1">
-              {me.is_admin ? 'admin' : me.roles.length ? me.roles.join(', ') : 'user'} ·{' '}
-              <span className="font-mono">{me.auth_mode}</span>
+          <div className="px-5 py-4 border-t border-stone-200 text-xs text-stone-500">
+            <div className="text-stone-700 truncate mb-0.5">
+              {me.is_admin ? 'admin' : me.roles.length ? me.roles.join(', ') : 'user'}
             </div>
-            <button onClick={signOut} className="hover:text-stone-700 underline">
-              Sign out
-            </button>
+            <div className="flex items-center justify-between">
+              <span className="font-mono text-stone-400">{me.auth_mode}</span>
+              <button
+                onClick={signOut}
+                className="text-stone-500 hover:text-stone-900 underline-offset-2 hover:underline"
+              >
+                Sign out
+              </button>
+            </div>
           </div>
         )}
       </aside>
-      <main className="flex-1 px-8 py-8 overflow-auto">
-        <Outlet />
+      <main className="flex-1 px-10 py-10 overflow-auto">
+        <div className="max-w-6xl">
+          <Outlet />
+        </div>
       </main>
     </div>
   );

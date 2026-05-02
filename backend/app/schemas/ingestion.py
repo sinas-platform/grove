@@ -1,0 +1,71 @@
+from __future__ import annotations
+
+import uuid
+from datetime import datetime
+from typing import Literal
+
+from pydantic import BaseModel, Field
+
+from app.schemas.common import ORMModel
+
+Stage = Literal[
+    "classifier",
+    "summarizer",
+    "property_extractor",
+    "entity_extractor",
+    "relationship_extractor",
+    "dossier_assigner",
+]
+
+
+class RunFilter(BaseModel):
+    """How to select documents for the run.
+
+    Empty filter = all documents. Combine fields = AND.
+    """
+
+    document_ids: list[uuid.UUID] | None = None
+    document_class_ids: list[uuid.UUID] | None = None
+    created_since: datetime | None = None
+    created_until: datetime | None = None
+
+
+class RunCreateIn(BaseModel):
+    stages: list[Stage] = Field(min_length=1)
+    filter: RunFilter = Field(default_factory=RunFilter)
+    dry_run: bool = False  # if true, returns the count without creating work
+
+
+class RunCreateOut(BaseModel):
+    run_id: uuid.UUID | None = None
+    document_count: int
+    unit_count: int  # docs × stages
+    status: str  # "started" | "would_start" (dry-run)
+
+
+class RunOut(ORMModel):
+    id: uuid.UUID
+    status: str
+    stages: list[str]
+    filter: dict
+    total_units: int
+    done_units: int
+    failed_units: int
+    error: str | None = None
+    started_by: uuid.UUID
+    created_at: datetime
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
+
+
+class RunUnitOut(ORMModel):
+    id: uuid.UUID
+    run_id: uuid.UUID
+    document_id: uuid.UUID
+    stage: str
+    status: str
+    error: str | None = None
+    attempts: int
+    chat_id: str | None = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None

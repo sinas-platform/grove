@@ -35,6 +35,12 @@ class Settings(BaseSettings):
     # carry their own auth).
     sinas_api_key: str = Field(default="", validation_alias="SINAS_API_KEY")
 
+    # Bulk-rerun worker concurrency cap. Caps simultaneous agent invocations
+    # the runner makes to Sinas. Higher = faster but burns LLM budget faster.
+    grove_rerun_concurrency: int = Field(
+        default=5, validation_alias="GROVE_RERUN_CONCURRENCY"
+    )
+
     @property
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.grove_cors_origins.split(",") if o.strip()]

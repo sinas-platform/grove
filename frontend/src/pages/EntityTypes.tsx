@@ -18,7 +18,7 @@ interface EntityType {
   guidance: string | null;
 }
 
-export default function EntityTypesPage() {
+export default function EntityTypesPage({ embedded = false }: { embedded?: boolean } = {}) {
   const qc = useQueryClient();
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
@@ -32,10 +32,24 @@ export default function EntityTypesPage() {
 
   return (
     <div>
-      <PageHeader
-        title="Entity types"
-        description="Canonical kinds of entities the entity_extractor_agent looks for inside documents."
-        actions={
+      {!embedded && (
+        <PageHeader
+          title="Entity types"
+          description="Canonical kinds of entities the entity_extractor_agent looks for inside documents."
+          actions={
+            <PrimaryButton
+              onClick={() => {
+                setSelectedId(null);
+                setCreating(true);
+              }}
+            >
+              New entity type
+            </PrimaryButton>
+          }
+        />
+      )}
+      {embedded && (
+        <div className="mb-4 flex justify-end">
           <PrimaryButton
             onClick={() => {
               setSelectedId(null);
@@ -44,8 +58,8 @@ export default function EntityTypesPage() {
           >
             New entity type
           </PrimaryButton>
-        }
-      />
+        </div>
+      )}
       <div className="grid grid-cols-12 gap-6">
         <div className="col-span-4 space-y-2">
           {(list.data ?? []).map((et) => (

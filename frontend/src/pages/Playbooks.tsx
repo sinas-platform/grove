@@ -15,7 +15,7 @@ const KINDS: { value: 'retrieval' | 'synthesis'; label: string }[] = [
   { value: 'synthesis', label: 'Synthesis' },
 ];
 
-export default function PlaybooksPage() {
+export default function PlaybooksPage({ embedded = false }: { embedded?: boolean } = {}) {
   const qc = useQueryClient();
   const [kind, setKind] = useState<'retrieval' | 'synthesis'>('retrieval');
   const [selected, setSelected] = useState<string | null>(null);
@@ -43,23 +43,28 @@ export default function PlaybooksPage() {
 
   const selectedPlaybook = list.data?.find((p) => p.name === selected) ?? null;
 
+  const newButton = (
+    <button
+      onClick={() => {
+        setSelected(null);
+        setCreating(true);
+      }}
+      className="px-3 py-1.5 rounded bg-forest-600 text-white text-sm hover:bg-forest-700"
+    >
+      New playbook
+    </button>
+  );
+
   return (
     <div>
-      <PageHeader
-        title="Playbooks"
-        description="Markdown skills agents load on demand. Stored in Sinas; managed here."
-        actions={
-          <button
-            onClick={() => {
-              setSelected(null);
-              setCreating(true);
-            }}
-            className="px-3 py-1.5 rounded bg-forest-600 text-white text-sm hover:bg-forest-700"
-          >
-            New playbook
-          </button>
-        }
-      />
+      {!embedded && (
+        <PageHeader
+          title="Playbooks"
+          description="Markdown skills agents load on demand. Stored in Sinas; managed here."
+          actions={newButton}
+        />
+      )}
+      {embedded && <div className="mb-4 flex justify-end">{newButton}</div>}
       <div className="flex gap-2 mb-4">
         {KINDS.map((k) => (
           <button

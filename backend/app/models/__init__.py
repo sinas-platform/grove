@@ -10,6 +10,13 @@ from app.models.config import (
     RelationshipDefinition,
     RelationshipState,
 )
+from app.models.discovery import (
+    ConfigProposal,
+    DiscoveryCandidate,
+    DiscoveryRun,
+    DiscoveryRunUnit,
+)
+from app.models.ingestion import IngestionRun, IngestionRunUnit
 from app.models.runtime import (
     Answer,
     AnswerClaim,
@@ -58,4 +65,10 @@ __all__ = [
     "Dossier",
     "DossierPropertyValue",
     "DossierDocument",
+    "IngestionRun",
+    "IngestionRunUnit",
+    "DiscoveryRun",
+    "DiscoveryRunUnit",
+    "DiscoveryCandidate",
+    "ConfigProposal",
 ]

@@ -3,6 +3,7 @@ from fastapi import APIRouter
 from app.api.v1 import (
     answers,
     config,
+    discovery,
     documents,
     dossiers,
     health,
@@ -12,6 +13,7 @@ from app.api.v1 import (
     relationships,
     results,
     retrieval,
+    runs,
     sinas_status,
     synthesis,
     uploads,
@@ -38,3 +40,5 @@ api_router.include_router(relationships.router)
 api_router.include_router(playbooks.router)
 api_router.include_router(sinas_status.router)
 api_router.include_router(uploads.router)
+api_router.include_router(runs.router)
+api_router.include_router(discovery.router)

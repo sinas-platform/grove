@@ -29,7 +29,7 @@ function slugify(name: string): string {
     .slice(0, 64);
 }
 
-export default function DossierClassesPage() {
+export default function DossierClassesPage({ embedded = false }: { embedded?: boolean } = {}) {
   const qc = useQueryClient();
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
@@ -43,10 +43,24 @@ export default function DossierClassesPage() {
 
   return (
     <div>
-      <PageHeader
-        title="Dossier classes"
-        description="Optional. Defines kinds of document containers (cases, transactions, investigations). Leave empty for flat repositories."
-        actions={
+      {!embedded && (
+        <PageHeader
+          title="Dossier classes"
+          description="Optional. Defines kinds of document containers (cases, transactions, investigations). Leave empty for flat repositories."
+          actions={
+            <PrimaryButton
+              onClick={() => {
+                setSelectedId(null);
+                setCreating(true);
+              }}
+            >
+              New dossier class
+            </PrimaryButton>
+          }
+        />
+      )}
+      {embedded && (
+        <div className="mb-4 flex justify-end">
           <PrimaryButton
             onClick={() => {
               setSelectedId(null);
@@ -55,8 +69,8 @@ export default function DossierClassesPage() {
           >
             New dossier class
           </PrimaryButton>
-        }
-      />
+        </div>
+      )}
       <div className="grid grid-cols-12 gap-6">
         <div className="col-span-4 space-y-2">
           {(list.data ?? []).map((dc) => (

@@ -9,7 +9,7 @@ metadata:
 
 package:
   name: sinas-grove
-  version: "0.1.6"
+  version: "0.1.8"
   description: >
     Sinas Grove — stateful, multi-agent document indexing and retrieval. The
     runtime is generic; domain knowledge (document classes, properties,
@@ -411,6 +411,47 @@ spec:
               relationship_definition_id: { type: string, format: uuid }
               source_id: { type: string, format: uuid }
               target_id: { type: string, format: uuid }
+
+        # ── discovery (config auto-suggestion) ──
+        - name: list_run_candidates
+          method: GET
+          path: /api/v1/discovery/runs/{{ run_id }}/candidates
+          parameters:
+            type: object
+            properties:
+              run_id: { type: string, format: uuid }
+            required: [run_id]
+          description: List raw discovery candidates for a run (used by the consolidator).
+
+        - name: submit_discovery_candidate
+          method: POST
+          path: /api/v1/discovery/candidates
+          parameters:
+            type: object
+            properties:
+              run_id: { type: string, format: uuid }
+              kind: { type: string }
+              payload: { type: object }
+              evidence_document_id: { type: string, format: uuid }
+              evidence_span: { type: object }
+              confidence: { type: number }
+            required: [run_id, kind, payload]
+          description: Submit a raw candidate config item discovered in a single document.
+
+        - name: submit_consolidated_proposal
+          method: POST
+          path: /api/v1/discovery/proposals
+          parameters:
+            type: object
+            properties:
+              run_id: { type: string, format: uuid }
+              kind: { type: string }
+              payload: { type: object }
+              supporting_candidate_ids:
+                type: array
+                items: { type: string, format: uuid }
+            required: [run_id, kind, payload, supporting_candidate_ids]
+          description: Submit a deduplicated proposal that folds multiple raw candidates.
 
         # ── synthesis ──
         - name: start_answer
@@ -1126,6 +1167,165 @@ spec:
           preload: false
       enabledAgents:
         - grove/faithfulness-validator-agent
+
+    # ───────── discovery (config auto-suggestion) ─────────
+    - namespace: grove
+      name: discovery-agent
+      description: Per-document config suggester. One parameterized agent across all kinds (document_class, entity_type, relationship_definition, dossier_class, document_class_property).
+      llmProviderName: ${{ vars.PRIMARY_LLM }}
+      systemPrompt: |
+        You suggest **new configuration items** based on what a single document
+        contains. Your input contains:
+
+          - run_id (uuid)
+          - kind: one of "document_class", "entity_type",
+                  "relationship_definition", "dossier_class",
+                  "document_class_property"
+          - mode: "greenfield" or "incremental"
+          - document_id (uuid)
+          - parent_class_id (uuid, only for kind=document_class_property)
+
+        Your job is to read the document and emit candidate config items via
+        `submit_discovery_candidate`. Each candidate is a *raw, per-document*
+        finding — it's fine if the same thing appears across many docs; the
+        consolidator agent will dedupe later.
+
+        ## Mode
+
+        - **greenfield**: ignore existing config; propose anything that would
+          help organize this corpus. Used when bootstrapping a new deployment.
+        - **incremental**: read existing config first via the appropriate
+          `get_*` operations. Only propose what isn't already covered. If a
+          mention fits an existing entity_type or class, don't re-propose it.
+
+        ## Per-kind expectations
+
+        - **document_class** — propose only when this document doesn't fit any
+          existing class well (incremental) or when you can identify a class
+          worth having (greenfield). Payload shape:
+          `{name, description, classification_hints}`.
+        - **entity_type** — propose entity types that show up multiple times
+          in this document and aren't covered by existing entity types.
+          Payload: `{name, description, guidance, sample_aliases: [...]}`.
+        - **relationship_definition** — propose if the document explicitly
+          relates two things in a way the existing definitions don't cover.
+          Payload:
+          ```
+          {
+            name, description, cardinality, extraction_guidance,
+            source_ref_type: "document_class" | "entity_type" | "dossier_class",
+            source_ref_name: "<existing config row's name>",
+            target_ref_type: ..., target_ref_name: ...
+          }
+          ```
+          Use the EXACT name of an existing document_class / entity_type /
+          dossier_class as you saw it in the config introspection ops. The
+          approval step resolves names to ids. If you propose a relationship
+          referring to something that doesn't yet exist as config, also
+          propose that thing as its own candidate (separate kind).
+        - **dossier_class** — only propose if dossiers are configured for
+          this deployment AND the document signals a kind of container that
+          isn't already a dossier class. Payload: `{name, description,
+          classification_hints}`.
+        - **document_class_property** — for the `parent_class_id` provided in
+          your input, propose extractable fields you see in the document.
+          Payload: `{document_class_id, name, description, schema, guidance,
+          sample_value}`.
+
+        ## How to operate
+
+        1. In incremental mode: load existing config via the appropriate
+           `get_*` connector op so you don't propose duplicates of what's
+           already configured.
+        2. Call `read_document_content` to read the document.
+        3. For each candidate finding, call `submit_discovery_candidate` with:
+            - `run_id` from your input
+            - `kind` from your input
+            - `payload` shaped per the kind
+            - `evidence_document_id` = document_id
+            - `evidence_span` = a small object describing where you found it
+              (line numbers, section title, or a short quote)
+            - `confidence` (0-1) — be conservative; the consolidator can
+              tolerate misses but false positives become noise
+        4. Return a brief reply summarizing how many candidates you submitted.
+
+        ## What NOT to do
+
+        - Do not invent things that aren't in the document.
+        - Do not propose a class/type/property purely from the filename.
+        - Do not call any agents.
+        - Do not read or modify already-extracted data (property values,
+          entity mentions). Discovery only inspects the document text.
+      enabledConnectors:
+        - connector: grove/api
+          operations:
+            - get_document
+            - read_document_content
+            - get_document_classes
+            - get_document_class_properties
+            - get_entity_types
+            - get_entity_types_for_class
+            - get_relationship_definitions
+            - get_dossier_classes
+            - submit_discovery_candidate
+
+    - namespace: grove
+      name: discovery-consolidator-agent
+      description: Reads raw discovery candidates for a run, clusters semantic duplicates, and emits deduplicated config_proposal rows.
+      llmProviderName: ${{ vars.PRIMARY_LLM }}
+      systemPrompt: |
+        You consolidate raw discovery candidates into deduplicated proposals.
+
+        Your input contains:
+          - run_id (uuid)
+          - kind: which kind to consolidate
+
+        ## Workflow
+
+        1. Call `list_run_candidates` with the run_id to fetch all raw
+           candidates for the run.
+        2. Cluster them by semantic similarity:
+            - Cluster `SalesContract`, `DealContract`, `Sales Agreement`,
+              `Sales contract` together — same concept, different wording.
+            - Don't merge things that are genuinely distinct just because
+              their names rhyme. When in doubt, leave them separate; the
+              admin can merge them in the review UI.
+        3. For each cluster, pick the clearest **canonical** name and
+           description. Combine descriptions and guidance from the cluster's
+           candidates so the proposal is the strongest version of the idea.
+        4. For each cluster, call `submit_consolidated_proposal` with:
+            - `run_id` from your input
+            - `kind` from your input
+            - `payload` shaped per the kind, using the canonical fields
+            - `supporting_candidate_ids` = every candidate id you folded
+              into this cluster (the admin uses these to inspect evidence)
+        5. Return a brief reply: how many candidates went in, how many
+           proposals came out.
+
+        ## Quality bar
+
+        - Be willing to merge aggressively for obvious duplicates, but never
+          merge two things that mean different operational outcomes (e.g.
+          "purchase contract" and "lease contract" — different lifecycles).
+        - Do not invent new candidates that weren't in the input list.
+        - Confidence: take the average of the merged candidates' confidences,
+          weighted by count. Include in the payload as `confidence_avg` if
+          useful for the reviewer.
+
+        ## Per-kind notes
+
+        - For `relationship_definition`: source/target refs in candidate
+          payloads are `{source_ref_type, source_ref_name}` and same for
+          target. Keep that shape on the consolidated payload — the
+          approval handler resolves names to ids automatically.
+        - For `document_class_property`: the `document_class_id` in candidate
+          payloads should always be the same within one run (it was passed
+          as `parent_class_id`). Keep it on the consolidated payload.
+      enabledConnectors:
+        - connector: grove/api
+          operations:
+            - list_run_candidates
+            - submit_consolidated_proposal
 
     - namespace: grove
       name: faithfulness-validator-agent

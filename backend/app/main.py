@@ -14,6 +14,9 @@ from starlette.responses import Response
 
 from app.api.v1 import api_router
 from app.config import get_settings
+from app.services.discovery_runner import start_worker as start_discovery_worker
+from app.services.discovery_runner import stop_worker as stop_discovery_worker
+from app.services.ingestion_runner import start_worker, stop_worker
 from app.services.sinas import get_management
 
 log = logging.getLogger(__name__)
@@ -27,7 +30,11 @@ async def lifespan(app: FastAPI):  # noqa: ARG001
     log.info("starting sinas-grove backend")
     log.info("auth mode: %s", settings.grove_auth_mode)
     log.info("sinas url: %s", settings.sinas_url)
+    start_worker()
+    start_discovery_worker()
     yield
+    await stop_worker()
+    await stop_discovery_worker()
     await get_management().aclose()
 
 

@@ -1,8 +1,13 @@
-import { useQuery } from '@tanstack/react-query';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { api } from '@/lib/api';
 import { PageHeader } from '@/components/PageHeader';
+import {
+  ErrorBanner,
+  PrimaryButton,
+  SecondaryButton,
+} from '@/components/Form';
 
 interface Document {
   id: string;
@@ -77,11 +82,17 @@ interface DocumentContent {
   version: number;
 }
 
+interface StageDesc {
+  key: string;
+  label: string;
+}
+
 type Tab = 'overview' | 'content' | 'properties' | 'entities' | 'relationships';
 
 export default function DocumentDetailPage() {
   const { id } = useParams<{ id: string }>();
   const [tab, setTab] = useState<Tab>('overview');
+  const [reprocessOpen, setReprocessOpen] = useState(false);
 
   const doc = useQuery({
     queryKey: ['document', id],
@@ -134,14 +145,23 @@ export default function DocumentDetailPage() {
           )
         }
         actions={
-          <Link
-            to="/documents"
-            className="px-3 py-1.5 rounded border border-stone-300 text-sm hover:bg-stone-100"
-          >
-            ← Back
-          </Link>
+          <div className="flex gap-2">
+            <SecondaryButton onClick={() => setReprocessOpen((v) => !v)}>
+              {reprocessOpen ? 'Cancel' : 'Reprocess…'}
+            </SecondaryButton>
+            <Link
+              to="/documents"
+              className="px-3 py-1.5 rounded border border-stone-300 text-sm hover:bg-stone-100"
+            >
+              ← Back
+            </Link>
+          </div>
         }
       />
+
+      {reprocessOpen && (
+        <ReprocessPanel docId={id} onClose={() => setReprocessOpen(false)} />
+      )}
 
       <div className="border-b border-stone-200 mb-6">
         <nav className="flex gap-1">
@@ -409,6 +429,87 @@ function RelationshipsTab({ docId }: { docId: string }) {
           </div>
         );
       })}
+    </div>
+  );
+}
+
+function ReprocessPanel({ docId, onClose }: { docId: string; onClose: () => void }) {
+  const qc = useQueryClient();
+  const stages = useQuery({
+    queryKey: ['ingestion-stages'],
+    queryFn: () => api<StageDesc[]>('/ingestion/stages'),
+  });
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [error, setError] = useState<string | null>(null);
+  const [runId, setRunId] = useState<string | null>(null);
+
+  const submit = useMutation({
+    mutationFn: () =>
+      api<{ run_id: string; unit_count: number; status: string }>(
+        `/ingestion/documents/${docId}/reprocess`,
+        { method: 'POST', body: JSON.stringify({ stages: Array.from(selected) }) },
+      ),
+    onSuccess: (res) => {
+      setError(null);
+      setRunId(res.run_id);
+      // Invalidate the doc so polling picks up class/summary updates.
+      void qc.invalidateQueries({ queryKey: ['document', docId] });
+    },
+    onError: (err) => setError(err instanceof Error ? err.message : 'failed'),
+  });
+
+  const toggle = (key: string) => {
+    const next = new Set(selected);
+    if (next.has(key)) next.delete(key);
+    else next.add(key);
+    setSelected(next);
+  };
+
+  return (
+    <div className="mb-6 p-4 border border-forest-500 bg-forest-50 rounded">
+      <div className="text-sm font-medium text-stone-900 mb-2">
+        Reprocess this document
+      </div>
+      <div className="text-xs text-stone-600 mb-3">
+        Pick which stages to rerun. Auto-extracted artifacts (entities, properties)
+        are wiped before re-running so they don't duplicate. Manual entries are kept.
+      </div>
+      <div className="grid grid-cols-2 gap-1 mb-3">
+        {(stages.data ?? []).map((s) => (
+          <label key={s.key} className="flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={selected.has(s.key)}
+              onChange={() => toggle(s.key)}
+            />
+            <span className="font-mono text-xs text-stone-500">{s.key}</span>
+            <span>— {s.label}</span>
+          </label>
+        ))}
+      </div>
+      <ErrorBanner message={error} />
+      {runId ? (
+        <div className="text-sm text-forest-700 mt-2">
+          Run started — track in{' '}
+          <Link to="/ingestion/runs" className="underline">
+            Ingestion runs
+          </Link>
+          .{' '}
+          <button onClick={onClose} className="underline">
+            Close
+          </button>
+        </div>
+      ) : (
+        <div className="flex gap-2 mt-2">
+          <PrimaryButton
+            onClick={() => submit.mutate()}
+            disabled={submit.isPending || selected.size === 0}
+          >
+            {submit.isPending ? 'Starting…' : `Run ${selected.size} stage(s)`}
+          </PrimaryButton>
+          <SecondaryButton onClick={onClose}>Cancel</SecondaryButton>
+        </div>
+      )}
     </div>
   );
 }

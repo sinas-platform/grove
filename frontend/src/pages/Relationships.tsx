@@ -52,7 +52,7 @@ const REF_TYPE_LABEL: Record<RefType, string> = {
   dossier_class: 'Dossier class',
 };
 
-export default function RelationshipsPage() {
+export default function RelationshipsPage({ embedded = false }: { embedded?: boolean } = {}) {
   const qc = useQueryClient();
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
@@ -84,10 +84,24 @@ export default function RelationshipsPage() {
 
   return (
     <div>
-      <PageHeader
-        title="Relationship definitions"
-        description="Edges between document/entity/dossier types — with extraction and discovery guidance, plus state semantics."
-        actions={
+      {!embedded && (
+        <PageHeader
+          title="Relationship definitions"
+          description="Edges between document/entity/dossier types — with extraction and discovery guidance, plus state semantics."
+          actions={
+            <PrimaryButton
+              onClick={() => {
+                setSelectedId(null);
+                setCreating(true);
+              }}
+            >
+              New relationship
+            </PrimaryButton>
+          }
+        />
+      )}
+      {embedded && (
+        <div className="mb-4 flex justify-end">
           <PrimaryButton
             onClick={() => {
               setSelectedId(null);
@@ -96,8 +110,8 @@ export default function RelationshipsPage() {
           >
             New relationship
           </PrimaryButton>
-        }
-      />
+        </div>
+      )}
       <div className="grid grid-cols-12 gap-6">
         <div className="col-span-4 space-y-2">
           {(list.data ?? []).map((rd) => (
