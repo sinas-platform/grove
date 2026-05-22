@@ -21,6 +21,10 @@ GROVE_COLLECTION = "documents"
 async def upload_document(
     file: UploadFile = File(...),
     metadata_json: str | None = Form(default=None),
+    staged: bool = Form(
+        default=False,
+        description="If true, document is parked and the auto-pipeline doesn't fire. Used for the discovery upload flow.",
+    ),
     caller: CallerIdentity = Depends(get_caller),
 ):
     if caller.sinas_token is None:
@@ -43,6 +47,8 @@ async def upload_document(
     if metadata is None:
         metadata = {}
     metadata.setdefault("source", "manual")
+    if staged:
+        metadata["staged"] = True
 
     client = SinasClient(base_url=get_settings().sinas_url, token=caller.sinas_token)
     result = await asyncio.to_thread(

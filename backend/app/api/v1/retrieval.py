@@ -1,8 +1,10 @@
-"""Retrieval — introspect, filter mutations, draft results.
+"""Retrieval — introspect, draft results, claim/answer publishing.
 
-The filter object lives in a Sinas State (keyed by chat id), but the agent
-sends it back to Grove on every call, so the API is stateless from Grove's
-perspective. Introspect and search both apply the same visibility filter.
+The current draft filter is persisted on `Result.filter` and mutated via
+the `/retrieval/results/{id}/filter/*` endpoints (see
+`app.api.v1.result_filter` and ADR `2026-05-14-stateful-filter-on-result`).
+The stateless `/retrieval/introspect` endpoint still exists for ad-hoc
+queries (UI, scripts) that don't want to materialize a Result first.
 """
 
 from __future__ import annotations
@@ -11,45 +13,18 @@ import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
-from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import CallerIdentity, get_caller, require_permission
 from app.db import get_session
-from app.models import Document, DocumentClassProperty, PropertyValue
 from app.schemas.runtime import (
     GroveFilter,
-    IntrospectFieldDistribution,
     IntrospectIn,
     IntrospectOut,
 )
-from app.services.visibility import visible_clause
+from app.services.introspect import introspect_with_filter
 
 router = APIRouter(prefix="/retrieval", tags=["retrieval"])
-
-
-def _apply_filter(stmt, f: GroveFilter):
-    if f.document_class_id is not None:
-        stmt = stmt.where(Document.document_class_id == f.document_class_id)
-    if f.explicit_excludes:
-        stmt = stmt.where(~Document.id.in_(f.explicit_excludes))
-    if f.text_search:
-        # use the FTS index
-        from sqlalchemy import text
-
-        stmt = stmt.where(
-            Document.id.in_(
-                select(text("document_version.document_id"))
-                .select_from(text("document_version"))
-                .where(text("content_tsvector @@ plainto_tsquery(:q)"))
-                .params(q=f.text_search)
-            )
-        )
-    # field_filters and regex_filters are intentionally not implemented in v1
-    # against properties — they require joining property_value rows, which is
-    # done in the introspect path. Real filter execution is the dev team's
-    # task during Phase 3 (see ARCHITECTURE.md §13).
-    return stmt
 
 
 @router.post("/introspect", response_model=IntrospectOut)
@@ -58,47 +33,11 @@ async def introspect(
     session: AsyncSession = Depends(get_session),
     caller: CallerIdentity = Depends(get_caller),
 ):
+    """Stateless introspect — pass a filter inline. Kept for ad-hoc/UI use.
+    The agent loop should prefer `/results/{id}/introspect`, which uses the
+    persisted filter and avoids re-emitting it on every iteration."""
     f = payload.filter or GroveFilter()
-    read_all = await caller.has_permission("grove.documents.read:all")
-
-    base = select(Document.id).where(visible_clause(Document, caller, read_all=read_all))
-    base = _apply_filter(base, f)
-    total = (
-        await session.execute(select(func.count()).select_from(base.subquery()))
-    ).scalar_one()
-
-    distributions: list[IntrospectFieldDistribution] = []
-    if f.document_class_id is not None:
-        # All properties on the class — present per-property value counts.
-        properties = (
-            await session.execute(
-                select(DocumentClassProperty).where(
-                    DocumentClassProperty.document_class_id == f.document_class_id
-                )
-            )
-        ).scalars().all()
-        for prop in properties:
-            if payload.fields and prop.name not in payload.fields:
-                continue
-            counts = (
-                await session.execute(
-                    select(PropertyValue.value, func.count().label("n"))
-                    .where(PropertyValue.property_id == prop.id)
-                    .where(PropertyValue.document_id.in_(base))
-                    .group_by(PropertyValue.value)
-                    .order_by(func.count().desc())
-                    .limit(payload.top_k)
-                )
-            ).all()
-            distributions.append(
-                IntrospectFieldDistribution(
-                    field=prop.name,
-                    values=[{"value": c[0], "count": int(c[1])} for c in counts],
-                    total_documents=total,
-                )
-            )
-
-    return IntrospectOut(candidate_count=total, distributions=distributions)
+    return await introspect_with_filter(session, caller, f, payload.fields, payload.top_k)
 
 
 # ───────────────────── draft result mutation operations ─────────────────────

@@ -7,10 +7,12 @@ from app.api.v1 import (
     documents,
     dossiers,
     health,
+    info,
     ingestion,
     me,
     playbooks,
     relationships,
+    result_filter,
     results,
     retrieval,
     runs,
@@ -27,12 +29,14 @@ api_router = APIRouter(prefix="/api/v1")
 api_router.include_router(get_sinas_auth().router, prefix="/auth", tags=["auth"])
 
 api_router.include_router(health.router)
+api_router.include_router(info.router)
 api_router.include_router(me.router)
 api_router.include_router(config.router)
 api_router.include_router(documents.router)
 api_router.include_router(dossiers.router)
 api_router.include_router(ingestion.router)
 api_router.include_router(retrieval.router)
+api_router.include_router(result_filter.router)
 api_router.include_router(results.router)
 api_router.include_router(synthesis.router)
 api_router.include_router(answers.router)

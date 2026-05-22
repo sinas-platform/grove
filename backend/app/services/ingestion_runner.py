@@ -1,14 +1,21 @@
-"""Bulk reprocess worker.
+"""Ingestion — no-worker design with classifier-first serialization.
 
-The worker loop polls `ingestion_run` for runs in 'pending' state, claims one,
-expands its filter into `ingestion_run_unit` rows (one per doc × stage), and
-processes them with a configurable concurrency cap. On Grove restart, runs
-in the 'running' state with pending units are resumed.
+Flow:
+  - `POST /ingestion/runs` calls `submit_run(...)` inside the request handler.
+    If `classifier` is among the requested stages, ONLY the classifier batch
+    is submitted at this point; other stages wait. Otherwise all stage
+    batches submit at once. Run transitions to "running".
+  - `GET /ingestion/runs/{id}` calls `progress(...)` which:
+      * Fetches live status for every submitted stage batch.
+      * If classifier batch is terminal AND secondary stages haven't been
+        submitted yet, atomically claim the transition and submit the
+        secondary batches.
+      * If every submitted batch is terminal, reconciles units and marks
+        the run completed.
+  - No background worker, no persisted user token. Each transition is
+    driven by a polling GET that carries a fresh user bearer.
 
-A unit is one (document, stage) — re-running a stage re-invokes the
-corresponding sub-agent. Stale auto-extracted artifacts are wiped before each
-agent runs (so we don't accumulate duplicate entity mentions / property
-values across reruns); manually-authored data is preserved.
+See Sinas's bulk-enqueue ADR for the underlying mechanics.
 """
 
 from __future__ import annotations
@@ -21,10 +28,9 @@ from typing import Any
 
 from sinas import SinasClient
 from sinas.exceptions import SinasAPIError
-from sqlalchemy import and_, delete, func, select
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import get_settings
 from app.db import AsyncSessionLocal
 from app.models import (
     Document,
@@ -34,22 +40,14 @@ from app.models import (
     PropertyValue,
 )
 from app.schemas.ingestion import RunFilter
-from app.services.sinas import get_admin_client
 
 log = logging.getLogger(__name__)
 
 
-# Per-stage config: which Sinas agent runs the work, and how to wipe stale
-# auto-extracted artifacts before re-running so we don't duplicate.
+# Per-stage agent assignment.
 STAGES: dict[str, dict[str, Any]] = {
-    "classifier": {
-        "agent": ("grove", "classifier-agent"),
-        "label": "Classification",
-    },
-    "summarizer": {
-        "agent": ("grove", "summarizer-agent"),
-        "label": "Summarization",
-    },
+    "classifier": {"agent": ("grove", "classifier-agent"), "label": "Classification"},
+    "summarizer": {"agent": ("grove", "summarizer-agent"), "label": "Summarization"},
     "property_extractor": {
         "agent": ("grove", "property-extractor-agent"),
         "label": "Property extraction",
@@ -68,12 +66,32 @@ STAGES: dict[str, dict[str, Any]] = {
     },
 }
 
+# Stages that depend on classifier having assigned a class. When classifier
+# is among the requested stages, these wait until classifier is terminal.
+_CLASSIFIER_DEPENDENT_STAGES = {
+    "summarizer",
+    "property_extractor",
+    "entity_extractor",
+    "relationship_extractor",
+    "dossier_assigner",
+}
+
+_TERMINAL_BATCH_STATUSES = {"completed", "partial", "failed", "cancelled"}
+
+# JSONB sentinel inside `sinas_batch_ids` that marks "secondary stages
+# already submitted" — used to win the race when two GETs try to fire the
+# secondary wave at the same time.
+_SECONDARY_CLAIMED_KEY = "_secondary_claimed"
+
+
+# ─────────────────────────────────────────────────────────────
+# Document selection (kept as-is for back-compat with existing API)
+# ─────────────────────────────────────────────────────────────
+
 
 async def _wipe_for_stage(session: AsyncSession, document_id: uuid.UUID, stage: str) -> None:
     """Delete stale auto-extracted artifacts so a rerun doesn't duplicate.
-
-    Manually-authored / locked entries are preserved.
-    """
+    Manually-authored / locked entries are preserved."""
     if stage == "property_extractor":
         await session.execute(
             delete(PropertyValue)
@@ -85,17 +103,28 @@ async def _wipe_for_stage(session: AsyncSession, document_id: uuid.UUID, stage: 
         await session.execute(
             delete(EntityMention).where(EntityMention.document_id == document_id)
         )
-    # classifier/summarizer overwrite document fields directly — no wipe needed.
-    # relationship_extractor / dossier_assigner: skip wipe in v1 (manual entries
-    # may exist; risk of duplicates is acceptable for now).
 
 
 async def _select_documents(session: AsyncSession, f: RunFilter) -> list[uuid.UUID]:
     stmt = select(Document.id)
     if f.document_ids:
         stmt = stmt.where(Document.id.in_(f.document_ids))
-    if f.document_class_ids:
-        stmt = stmt.where(Document.document_class_id.in_(f.document_class_ids))
+    if f.staged_only:
+        stmt = stmt.where(Document.staged.is_(True))
+    else:
+        class_clauses = []
+        if f.document_class_ids:
+            class_clauses.append(Document.document_class_id.in_(f.document_class_ids))
+        if f.include_unclassified:
+            class_clauses.append(Document.document_class_id.is_(None))
+        if f.max_classification_confidence is not None:
+            class_clauses.append(
+                Document.classification_confidence <= f.max_classification_confidence
+            )
+        if class_clauses:
+            stmt = stmt.where(or_(*class_clauses))
+        if not f.include_staged:
+            stmt = stmt.where(Document.staged.is_(False))
     if f.created_since:
         stmt = stmt.where(Document.created_at >= f.created_since)
     if f.created_until:
@@ -109,10 +138,7 @@ async def expand_filter(session: AsyncSession, f: RunFilter) -> list[uuid.UUID]:
     return await _select_documents(session, f)
 
 
-async def materialize_run(
-    session: AsyncSession,
-    run: IngestionRun,
-) -> int:
+async def materialize_run(session: AsyncSession, run: IngestionRun) -> int:
     """Insert IngestionRunUnit rows for every (doc, stage) pair. Returns count."""
     f = RunFilter(**(run.filter or {}))
     doc_ids = await _select_documents(session, f)
@@ -133,222 +159,310 @@ async def materialize_run(
     return len(units)
 
 
-def _invoke_agent_sync(
-    client: SinasClient, namespace: str, agent_name: str, document_id: uuid.UUID, stage: str
-) -> dict[str, Any]:
-    """Sync wrapper around the SDK invoke; called via asyncio.to_thread."""
-    return client.chats.invoke(
-        namespace=namespace,
-        agent_name=agent_name,
-        message=(
-            f"Reprocess document {document_id} for stage '{stage}'. "
-            "Run only this stage; do not invoke other agents."
-        ),
-        input={"document_id": str(document_id), "stage": stage},
-    )
+# ─────────────────────────────────────────────────────────────
+# Batch submission
+# ─────────────────────────────────────────────────────────────
 
 
-async def _process_unit(
-    unit: IngestionRunUnit, client: SinasClient
-) -> tuple[bool, str | None, str | None]:
-    """Process a single (doc, stage) unit. Returns (ok, error, chat_id)."""
-    stage_cfg = STAGES.get(unit.stage)
+def _build_stage_inputs(stage: str, doc_ids: list[uuid.UUID]) -> list[dict[str, Any]]:
+    return [
+        {
+            "input_variables": {"document_id": str(d), "stage": stage},
+            "message": (
+                f"Reprocess document {d} for stage '{stage}'. "
+                "Run only this stage; do not invoke other agents."
+            ),
+        }
+        for d in doc_ids
+    ]
+
+
+async def _submit_stage(
+    session: AsyncSession,
+    run: IngestionRun,
+    stage: str,
+    units: list[IngestionRunUnit],
+    client: SinasClient,
+) -> None:
+    """Wipe + submit one stage's batch. Mutates the units (status, batch_id,
+    execution_id) and `run.sinas_batch_ids`."""
+    if not units:
+        return
+    stage_cfg = STAGES.get(stage)
     if stage_cfg is None:
-        return False, f"unknown stage '{unit.stage}'", None
+        log.error("unknown stage '%s' on run %s", stage, run.id)
+        return
     namespace, agent_name = stage_cfg["agent"]
 
-    # Wipe stale auto-extracted artifacts in its own transaction so the agent
-    # writes into a clean slate.
-    async with AsyncSessionLocal() as session:
+    # Pre-wipe stale artifacts.
+    for u in units:
         try:
-            await _wipe_for_stage(session, unit.document_id, unit.stage)
-            await session.commit()
+            await _wipe_for_stage(session, u.document_id, stage)
         except Exception as exc:  # noqa: BLE001
-            await session.rollback()
-            return False, f"wipe failed: {type(exc).__name__}: {exc}", None
+            log.warning("wipe failed for doc %s stage %s: %s", u.document_id, stage, exc)
+    await session.flush()
 
-    # Invoke the agent. The SDK is sync; offload to a thread.
+    doc_ids = [u.document_id for u in units]
     try:
         result = await asyncio.to_thread(
-            _invoke_agent_sync, client, namespace, agent_name, unit.document_id, unit.stage
+            client.agents.submit_batch,
+            namespace=namespace,
+            name=agent_name,
+            inputs=_build_stage_inputs(stage, doc_ids),
+            trigger_id_prefix=f"grove:ingest:{run.id}:{stage}",
         )
     except SinasAPIError as exc:
-        return False, f"sinas: {exc}", None
-    except Exception as exc:  # noqa: BLE001
-        return False, f"{type(exc).__name__}: {exc}", None
-    chat_id = result.get("chat_id") if isinstance(result, dict) else None
-    return True, None, chat_id
+        now = datetime.now(timezone.utc)
+        for u in units:
+            u.status = "failed"
+            u.error = f"batch submit: {exc}"
+            u.completed_at = now
+            run.done_units += 1
+            run.failed_units += 1
+        return
+
+    batch_id = result["batch_id"]
+    execution_ids = result.get("execution_ids") or []
+    chat_ids = result.get("chat_ids") or []
+    now = datetime.now(timezone.utc)
+    for idx, u in enumerate(units):
+        u.status = "running"
+        u.started_at = now
+        u.attempts += 1
+        if idx < len(execution_ids):
+            u.sinas_execution_id = execution_ids[idx]
+        if idx < len(chat_ids):
+            u.chat_id = chat_ids[idx]
+    run.sinas_batch_ids = {**(run.sinas_batch_ids or {}), stage: batch_id}
 
 
-async def _claim_next_pending_unit(
-    session: AsyncSession, run_id: uuid.UUID
-) -> IngestionRunUnit | None:
-    """Pick the next pending unit for a run, mark it running atomically."""
-    # Postgres SKIP LOCKED would be ideal here, but for simplicity we just
-    # rely on the worker being single-process. If we ever scale to multiple
-    # Grove backends, switch to SELECT … FOR UPDATE SKIP LOCKED.
-    row = (
-        await session.execute(
-            select(IngestionRunUnit)
-            .where(IngestionRunUnit.run_id == run_id)
-            .where(IngestionRunUnit.status == "pending")
-            .order_by(IngestionRunUnit.created_at)
-            .limit(1)
-            .with_for_update(skip_locked=True)
+async def submit_run(
+    session: AsyncSession, run: IngestionRun, client: SinasClient
+) -> None:
+    """Submit batches for the run. If classifier is in stages, submit ONLY
+    classifier (secondary stages wait for classifier-terminal in `progress`).
+    Otherwise submit all stage batches.
+
+    Called from the request handler holding the user's bearer; caller commits.
+    """
+    units = list(
+        (
+            await session.execute(
+                select(IngestionRunUnit)
+                .where(IngestionRunUnit.run_id == run.id)
+                .order_by(IngestionRunUnit.created_at)
+            )
+        ).scalars().all()
+    )
+    if not units:
+        run.status = "completed"
+        run.completed_at = datetime.now(timezone.utc)
+        return
+
+    by_stage: dict[str, list[IngestionRunUnit]] = {}
+    for u in units:
+        by_stage.setdefault(u.stage, []).append(u)
+
+    run.status = "running"
+    run.started_at = datetime.now(timezone.utc)
+
+    has_classifier = "classifier" in by_stage and "classifier" in run.stages
+    if has_classifier:
+        # Phase 1: classifier only. Secondary stages stay pending; their
+        # units sit unchanged in DB. The progress endpoint fires them when
+        # classifier is terminal.
+        await _submit_stage(session, run, "classifier", by_stage["classifier"], client)
+    else:
+        # No classifier in this run — submit everything at once.
+        for stage, stage_units in by_stage.items():
+            if stage in STAGES:
+                await _submit_stage(session, run, stage, stage_units, client)
+
+
+# ─────────────────────────────────────────────────────────────
+# Progress (called from GET /ingestion/runs/{id})
+# ─────────────────────────────────────────────────────────────
+
+
+async def _reconcile_stage_units(
+    client: SinasClient,
+    run_id: uuid.UUID,
+    stage: str,
+    batch_id: str,
+) -> None:
+    """Drill into per-execution status and mark unit rows + run counters."""
+    offset = 0
+    while True:
+        executions = await asyncio.to_thread(
+            client.batches.list_executions, batch_id, limit=500, offset=offset
         )
-    ).scalar_one_or_none()
-    if row is None:
-        return None
-    row.status = "running"
-    row.started_at = datetime.now(timezone.utc)
-    row.attempts += 1
-    await session.commit()
-    return row
-
-
-async def _execute_run(run_id: uuid.UUID) -> None:
-    """Process all pending units for a run with bounded concurrency."""
-    settings = get_settings()
-    sem = asyncio.Semaphore(settings.grove_rerun_concurrency)
-    client = get_admin_client()
-
-    async def worker() -> None:
-        while True:
-            async with AsyncSessionLocal() as session:
-                unit = await _claim_next_pending_unit(session, run_id)
-            if unit is None:
-                return
-            async with sem:
-                ok, err, chat_id = await _process_unit(unit, client)
-            async with AsyncSessionLocal() as session:
-                u = await session.get(IngestionRunUnit, unit.id)
-                if u is None:
+        if not executions:
+            break
+        async with AsyncSessionLocal() as session:
+            for execution in executions:
+                exec_id = execution.get("execution_id") or execution.get("id")
+                if exec_id is None:
                     continue
-                u.status = "succeeded" if ok else "failed"
-                u.error = err
-                u.chat_id = chat_id
-                u.completed_at = datetime.now(timezone.utc)
-                # Increment run-level counters.
+                unit = (
+                    await session.execute(
+                        select(IngestionRunUnit)
+                        .where(IngestionRunUnit.sinas_execution_id == exec_id)
+                        .where(IngestionRunUnit.run_id == run_id)
+                        .where(IngestionRunUnit.stage == stage)
+                    )
+                ).scalar_one_or_none()
+                if unit is None or unit.status in ("succeeded", "failed"):
+                    continue  # already reconciled
+                exec_status = (execution.get("status") or "").upper()
+                ok = exec_status == "COMPLETED"
+                unit.status = "succeeded" if ok else "failed"
+                if not ok:
+                    unit.error = execution.get("error") or f"sinas: {exec_status}"
+                unit.chat_id = execution.get("chat_id") or unit.chat_id
+                unit.completed_at = datetime.now(timezone.utc)
                 run = await session.get(IngestionRun, run_id)
                 if run is not None:
                     run.done_units += 1
                     if not ok:
                         run.failed_units += 1
-                await session.commit()
-
-    # Spawn N workers up to the concurrency cap.
-    workers = [asyncio.create_task(worker()) for _ in range(settings.grove_rerun_concurrency)]
-    try:
-        await asyncio.gather(*workers, return_exceptions=False)
-    finally:
-        # Mark run completed.
-        async with AsyncSessionLocal() as session:
-            run = await session.get(IngestionRun, run_id)
-            if run is not None and run.status == "running":
-                pending = (
-                    await session.execute(
-                        select(func.count())
-                        .select_from(IngestionRunUnit)
-                        .where(IngestionRunUnit.run_id == run_id)
-                        .where(IngestionRunUnit.status.in_(["pending", "running"]))
-                    )
-                ).scalar_one()
-                if pending == 0:
-                    run.status = "completed" if run.failed_units == 0 else "completed"
-                    run.completed_at = datetime.now(timezone.utc)
-                    await session.commit()
+            await session.commit()
+        if len(executions) < 500:
+            break
+        offset += 500
 
 
-# ────────────────────── background worker loop ──────────────────────
-_worker_task: asyncio.Task | None = None
-_shutdown = asyncio.Event()
+async def _claim_secondary_submission(run_id: uuid.UUID) -> bool:
+    """Atomic CAS on sinas_batch_ids: add `_secondary_claimed: true` only if
+    not already present. Returns True if THIS call won the race."""
+    # `jsonb ? key` returns true if the JSON object has the key. We update
+    # only when the key is absent.
+    from sqlalchemy import text
 
-
-async def _claim_next_run() -> uuid.UUID | None:
     async with AsyncSessionLocal() as session:
-        row = (
-            await session.execute(
-                select(IngestionRun)
-                .where(IngestionRun.status == "pending")
-                .order_by(IngestionRun.created_at)
-                .limit(1)
-                .with_for_update(skip_locked=True)
-            )
-        ).scalar_one_or_none()
-        if row is None:
-            return None
-        row.status = "running"
-        row.started_at = datetime.now(timezone.utc)
+        result = await session.execute(
+            text(
+                "UPDATE ingestion_run "
+                "SET sinas_batch_ids = sinas_batch_ids || jsonb_build_object(:k, true) "
+                "WHERE id = :id AND NOT (sinas_batch_ids ? :k)"
+            ),
+            {"k": _SECONDARY_CLAIMED_KEY, "id": str(run_id)},
+        )
         await session.commit()
-        return row.id
+        return result.rowcount > 0
 
 
-async def _resume_running_runs() -> list[uuid.UUID]:
-    """On startup, find runs that were 'running' but the worker died.
-    Reset their in-flight units to pending so they pick back up."""
+async def _submit_secondary_stages(run_id: uuid.UUID, client: SinasClient) -> None:
+    """Submit batches for every non-classifier stage that has pending units."""
     async with AsyncSessionLocal() as session:
-        runs = (
-            await session.execute(
-                select(IngestionRun.id).where(IngestionRun.status == "running")
-            )
-        ).scalars().all()
-        for run_id in runs:
-            await session.execute(
-                IngestionRunUnit.__table__.update()
-                .where(IngestionRunUnit.run_id == run_id)
-                .where(IngestionRunUnit.status == "running")
-                .values(status="pending")
-            )
+        run = await session.get(IngestionRun, run_id)
+        if run is None:
+            return
+        pending_units = list(
+            (
+                await session.execute(
+                    select(IngestionRunUnit)
+                    .where(IngestionRunUnit.run_id == run_id)
+                    .where(IngestionRunUnit.status == "pending")
+                    .where(IngestionRunUnit.stage != "classifier")
+                    .order_by(IngestionRunUnit.created_at)
+                )
+            ).scalars().all()
+        )
+        if not pending_units:
+            return
+        by_stage: dict[str, list[IngestionRunUnit]] = {}
+        for u in pending_units:
+            by_stage.setdefault(u.stage, []).append(u)
+        for stage, units in by_stage.items():
+            if stage in STAGES:
+                await _submit_stage(session, run, stage, units, client)
         await session.commit()
-        return list(runs)
 
 
-async def _worker_loop() -> None:
-    log.info("ingestion-runner worker started")
-    # Pick up runs that were mid-flight when the previous process died.
-    resumed = await _resume_running_runs()
-    for run_id in resumed:
-        log.info("resuming ingestion run %s", run_id)
-        try:
-            await _execute_run(run_id)
-        except Exception as exc:  # noqa: BLE001
-            log.exception("resumed run %s crashed: %s", run_id, exc)
+async def _mark_run_terminal_if_done(run_id: uuid.UUID) -> None:
+    async with AsyncSessionLocal() as session:
+        run = await session.get(IngestionRun, run_id)
+        if run is None or run.status != "running":
+            return
+        pending = int(
+            (
+                await session.execute(
+                    select(func.count())
+                    .select_from(IngestionRunUnit)
+                    .where(IngestionRunUnit.run_id == run_id)
+                    .where(IngestionRunUnit.status.in_(["pending", "running"]))
+                )
+            ).scalar_one()
+        )
+        if pending == 0:
+            run.status = "completed"
+            run.completed_at = datetime.now(timezone.utc)
+            await session.commit()
 
-    while not _shutdown.is_set():
-        run_id = await _claim_next_run()
-        if run_id is None:
-            try:
-                await asyncio.wait_for(_shutdown.wait(), timeout=2.0)
-            except asyncio.TimeoutError:
-                pass
+
+async def progress(run: IngestionRun, client: SinasClient) -> dict[str, Any]:
+    """Drive the run forward and return a per-stage status snapshot.
+
+    Called from `GET /ingestion/runs/{id}`. The caller's bearer is forwarded
+    to Sinas via the provided client.
+    """
+    batch_ids = dict(run.sinas_batch_ids or {})
+    # Strip out internal sentinels for display.
+    visible_batches = {k: v for k, v in batch_ids.items() if not k.startswith("_")}
+
+    snapshot: dict[str, Any] = {
+        "status": run.status,
+        "stages": {},  # stage_name -> Sinas batch status dict
+    }
+
+    # Pull live status for every submitted stage.
+    for stage, batch_id in visible_batches.items():
+        if stage not in STAGES:
             continue
-        log.info("starting ingestion run %s", run_id)
         try:
-            await _execute_run(run_id)
-        except Exception as exc:  # noqa: BLE001
-            log.exception("run %s crashed: %s", run_id, exc)
-            async with AsyncSessionLocal() as session:
-                run = await session.get(IngestionRun, run_id)
-                if run is not None:
-                    run.status = "failed"
-                    run.error = f"{type(exc).__name__}: {exc}"
-                    run.completed_at = datetime.now(timezone.utc)
-                    await session.commit()
-    log.info("ingestion-runner worker stopped")
+            status = await asyncio.to_thread(client.batches.get, batch_id)
+        except SinasAPIError as exc:
+            snapshot["stages"][stage] = {"error": str(exc)}
+            continue
+        snapshot["stages"][stage] = status
+        if status.get("status") in _TERMINAL_BATCH_STATUSES:
+            await _reconcile_stage_units(client, run.id, stage, batch_id)
 
+    # If classifier is in stages and just turned terminal, fire secondary stages.
+    classifier_batch_id = visible_batches.get("classifier")
+    if classifier_batch_id is not None:
+        classifier_status = snapshot["stages"].get("classifier", {}).get("status")
+        if classifier_status in _TERMINAL_BATCH_STATUSES:
+            secondary_pending = any(
+                stage not in visible_batches and stage in run.stages
+                for stage in _CLASSIFIER_DEPENDENT_STAGES
+            )
+            if secondary_pending:
+                won = await _claim_secondary_submission(run.id)
+                if won:
+                    await _submit_secondary_stages(run.id, client)
+                # Refresh and re-snapshot the new stages.
+                async with AsyncSessionLocal() as s:
+                    refreshed = await s.get(IngestionRun, run.id)
+                    if refreshed is not None:
+                        batch_ids = dict(refreshed.sinas_batch_ids or {})
+                        visible_batches = {
+                            k: v for k, v in batch_ids.items() if not k.startswith("_")
+                        }
+                for stage, batch_id in visible_batches.items():
+                    if stage in STAGES and stage not in snapshot["stages"]:
+                        try:
+                            snapshot["stages"][stage] = await asyncio.to_thread(
+                                client.batches.get, batch_id
+                            )
+                        except SinasAPIError as exc:
+                            snapshot["stages"][stage] = {"error": str(exc)}
 
-def start_worker() -> asyncio.Task:
-    global _worker_task
-    if _worker_task is None or _worker_task.done():
-        _shutdown.clear()
-        _worker_task = asyncio.create_task(_worker_loop(), name="ingestion-runner")
-    return _worker_task
+    # Mark run terminal if every unit has reached a terminal status.
+    await _mark_run_terminal_if_done(run.id)
+    async with AsyncSessionLocal() as s:
+        refreshed = await s.get(IngestionRun, run.id)
+        if refreshed is not None:
+            snapshot["status"] = refreshed.status
 
-
-async def stop_worker() -> None:
-    _shutdown.set()
-    if _worker_task is not None:
-        try:
-            await asyncio.wait_for(_worker_task, timeout=5.0)
-        except (asyncio.TimeoutError, asyncio.CancelledError):
-            _worker_task.cancel()
+    return snapshot

@@ -5,7 +5,8 @@ from __future__ import annotations
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import desc, select
+from pydantic import BaseModel
+from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import CallerIdentity, get_caller, require_permission
@@ -51,16 +52,79 @@ async def _document_visibility(model, caller: CallerIdentity):
 @router.get("", response_model=list[DocumentOut])
 async def list_documents(
     document_class_id: uuid.UUID | None = Query(default=None),
+    unclassified_only: bool = Query(default=False),
+    staged_only: bool = Query(default=False),
+    include_staged: bool = Query(
+        default=False,
+        description="If true, staged docs appear alongside the rest. Default excludes them.",
+    ),
     limit: int = Query(default=50, le=200),
     offset: int = Query(default=0, ge=0),
     session: AsyncSession = Depends(get_session),
     caller: CallerIdentity = Depends(get_caller),
 ):
     stmt = select(Document).where(await _document_visibility(Document, caller))
-    if document_class_id is not None:
-        stmt = stmt.where(Document.document_class_id == document_class_id)
+    if staged_only:
+        stmt = stmt.where(Document.staged.is_(True))
+    elif unclassified_only:
+        stmt = stmt.where(Document.document_class_id.is_(None))
+        if not include_staged:
+            stmt = stmt.where(Document.staged.is_(False))
+    else:
+        if document_class_id is not None:
+            stmt = stmt.where(Document.document_class_id == document_class_id)
+        if not include_staged:
+            stmt = stmt.where(Document.staged.is_(False))
     stmt = stmt.order_by(desc(Document.created_at)).limit(limit).offset(offset)
     return (await session.execute(stmt)).scalars().all()
+
+
+class DocumentCountsOut(BaseModel):
+    total: int
+    unclassified: int
+    staged: int
+    by_class: dict[str, int]  # document_class_id (str) -> count, unstaged only
+
+
+@router.get("/counts", response_model=DocumentCountsOut)
+async def get_document_counts(
+    session: AsyncSession = Depends(get_session),
+    caller: CallerIdentity = Depends(get_caller),
+):
+    visibility = await _document_visibility(Document, caller)
+    # Staged is its own bucket — count separately so by_class reflects only
+    # processed docs (the user-facing dimension).
+    staged_count = int(
+        (
+            await session.execute(
+                select(func.count())
+                .select_from(Document)
+                .where(visibility)
+                .where(Document.staged.is_(True))
+            )
+        ).scalar_one()
+    )
+    rows = (
+        await session.execute(
+            select(Document.document_class_id, func.count())
+            .where(visibility)
+            .where(Document.staged.is_(False))
+            .group_by(Document.document_class_id)
+        )
+    ).all()
+    by_class: dict[str, int] = {}
+    unclassified = 0
+    for class_id, count in rows:
+        if class_id is None:
+            unclassified = int(count)
+        else:
+            by_class[str(class_id)] = int(count)
+    return DocumentCountsOut(
+        total=unclassified + sum(by_class.values()) + staged_count,
+        unclassified=unclassified,
+        staged=staged_count,
+        by_class=by_class,
+    )
 
 
 @router.get("/{doc_id}", response_model=DocumentOut)
@@ -130,6 +194,11 @@ async def list_document_versions(
     return rows
 
 
+# Max lines returned per call. Keeps tool responses small enough for agents
+# to handle multiple chunks across turns without blowing the context window.
+_READ_MAX_LINES = 500
+
+
 @router.get("/{doc_id}/versions/{version}/content")
 async def read_document_content(
     doc_id: uuid.UUID,
@@ -157,31 +226,58 @@ async def read_document_content(
     ).scalar_one_or_none()
     if dv is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "version not found")
-    # The version row exists; content may still be empty if extraction
-    # hasn't run / failed. Tell the caller explicitly instead of 404'ing
-    # so an agent can route around the missing text.
     if dv.content_md is None:
         return {
             "document_id": doc_id,
             "version": version,
-            "line_from": line_from,
-            "line_to": line_to,
+            "line_from": None,
+            "line_to": None,
+            "total_lines": 0,
+            "returned_lines": 0,
+            "next_line": None,
+            "is_truncated": False,
             "content": "",
             "extracted": False,
             "note": "version exists but no extracted text — post-upload extraction may have failed or hasn't run yet",
         }
-    content = dv.content_md
-    if line_from or line_to:
-        lines = content.splitlines()
-        start = (line_from - 1) if line_from else 0
-        end = line_to if line_to else len(lines)
-        content = "\n".join(lines[start:end])
+
+    lines = dv.content_md.splitlines()
+    total = len(lines)
+
+    # Resolve the requested window, capped to _READ_MAX_LINES so a single
+    # call never returns more than that. The agent paginates by calling
+    # again with line_from = response.next_line.
+    start_1 = line_from or 1
+    requested_end_1 = line_to if line_to is not None else total
+    end_1 = min(requested_end_1, start_1 + _READ_MAX_LINES - 1, total)
+
+    # Convert to 0-based slice and extract.
+    start_0 = start_1 - 1
+    if start_0 >= total:
+        slice_lines: list[str] = []
+        actual_start_1 = start_1
+        actual_end_1 = start_1 - 1  # empty
+    else:
+        slice_lines = lines[start_0:end_1]
+        actual_start_1 = start_1
+        actual_end_1 = start_0 + len(slice_lines)
+
+    next_line: int | None
+    if actual_end_1 >= total:
+        next_line = None
+    else:
+        next_line = actual_end_1 + 1
+
     return {
         "document_id": doc_id,
         "version": version,
-        "line_from": line_from,
-        "line_to": line_to,
-        "content": content,
+        "line_from": actual_start_1,
+        "line_to": actual_end_1,
+        "total_lines": total,
+        "returned_lines": len(slice_lines),
+        "next_line": next_line,
+        "is_truncated": next_line is not None,
+        "content": "\n".join(slice_lines),
         "extracted": True,
     }
 

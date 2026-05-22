@@ -18,7 +18,8 @@ pydantic = { extras = ["email"], version = "^2.7" }
 pydantic-settings = "^2.3"
 httpx = "^0.27"
 python-multipart = "^0.0.9"
-sinas = { extras = ["fastapi"], version = ">=0.1.8" }
+sinas = { extras = ["fastapi"], version = ">=0.2.0" }
+pyyaml = "^6"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8"

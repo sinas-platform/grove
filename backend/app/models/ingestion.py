@@ -26,6 +26,12 @@ class IngestionRun(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Sinas batch_ids per stage name (e.g. "classifier", "summarizer", …).
+    # Also carries internal `_secondary_claimed` sentinel marking that the
+    # classifier-first transition has been fired.
+    sinas_batch_ids: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default="{}"
+    )
 
 
 class IngestionRunUnit(Base):
@@ -47,6 +53,7 @@ class IngestionRunUnit(Base):
     # Sinas chat id from the agent invocation — admins can paste it into the
     # Sinas console to inspect the full agent transcript for this unit.
     chat_id: Mapped[str | None] = mapped_column(String(64))
+    sinas_execution_id: Mapped[str | None] = mapped_column(String(64))
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

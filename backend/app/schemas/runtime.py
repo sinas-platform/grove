@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from app.schemas.common import ORMModel, OwnedOut, Span, TimestampedOut
 
@@ -19,6 +19,7 @@ class DocumentOut(OwnedOut):
     document_class_id: uuid.UUID | None = None
     classification_confidence: float | None = None
     collection_file_id: str | None = None
+    staged: bool = False
 
 
 class DocumentPatch(BaseModel):
@@ -58,6 +59,15 @@ class PropertyValueOut(TimestampedOut):
     schema_version: int
     locked: bool
     reason: str | None = None
+
+    @field_validator("value", mode="before")
+    @classmethod
+    def _unwrap_value(cls, v: Any) -> Any:
+        # Scalars and lists are wrapped as {"_": x} on write so they fit a JSONB
+        # dict column; unwrap on read so callers see the natural value.
+        if isinstance(v, dict) and set(v.keys()) == {"_"}:
+            return v["_"]
+        return v
 
 
 # ─────────────────────────────────────────────────────────────
@@ -128,6 +138,8 @@ class ResultOut(OwnedOut):
     status: str
     parent_result_id: uuid.UUID | None = None
     published_at: datetime | None = None
+    filter: dict[str, Any] = Field(default_factory=dict)
+    filter_version: int = 0
 
 
 class ResultDocumentOut(TimestampedOut):
@@ -200,7 +212,9 @@ class DossierDocumentOut(TimestampedOut, DossierDocumentIn):
 
 
 # ─────────────────────────────────────────────────────────────
-# Retrieval — filter object lives in Sinas State, but we mirror it here
+# Retrieval — filter object is persisted on Result.filter and mutated via
+# /retrieval/results/{id}/filter/* endpoints. See ADR
+# docs/adrs/2026-05-14-stateful-filter-on-result.md.
 # ─────────────────────────────────────────────────────────────
 class FieldFilter(BaseModel):
     field: str

@@ -27,6 +27,10 @@ class Document(Base, TimestampMixin, OwnedMixin):
     current_version_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
     classification_confidence: Mapped[float | None] = mapped_column(Float)
     collection_file_id: Mapped[str | None] = mapped_column(String(500), index=True)
+    # Staged docs skip the auto-ingestion pipeline (classifier + extractors
+    # don't fire on upload). Discovery and front-matter scans still see them;
+    # retrieval does not. Flips false when a manual IngestionRun completes.
+    staged: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
 
     versions: Mapped[list["DocumentVersion"]] = relationship(
         back_populates="document",
@@ -191,6 +195,16 @@ class Result(Base, TimestampMixin, OwnedMixin):
         UUID(as_uuid=True), ForeignKey("result.id", ondelete="SET NULL")
     )
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # The current draft filter (GroveFilter shape). Mutated via the
+    # /retrieval/results/{id}/filter/* endpoints. Frozen on publish.
+    filter: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default="{}"
+    )
+    # Optimistic concurrency token. Mutations require matching version and
+    # 409 on mismatch. See ADR 2026-05-14-stateful-filter-on-result.
+    filter_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
 
 
 class ResultDocument(Base, TimestampMixin):

@@ -1,16 +1,20 @@
 import { createContext, useContext, useEffect, useState, type ReactNode } from 'react';
-import { api, setUnauthenticatedHandler, tokens } from './api';
+import type { InfoResponse } from '@sinas/sdk';
+import { api, client, setUnauthenticatedHandler, tokens } from './api';
 
 export interface Me {
   user_id: string;
   roles: string[];
   is_admin: boolean;
+  /** Grove's own auth mode (whether grove uses real Sinas auth or a single admin key). */
   auth_mode: 'sinas' | 'simplified';
 }
 
 interface AuthState {
   status: 'loading' | 'authenticated' | 'unauthenticated';
   me: Me | null;
+  /** Sinas-side auth_mode (otp / password / password+otp). Null while loading or on error. */
+  info: InfoResponse | null;
   setSession: (access: string, refresh: string) => Promise<void>;
   signOut: () => Promise<void>;
   refresh: () => Promise<void>;
@@ -21,6 +25,7 @@ const AuthContext = createContext<AuthState | null>(null);
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [status, setStatus] = useState<AuthState['status']>('loading');
   const [me, setMe] = useState<Me | null>(null);
+  const [info, setInfo] = useState<InfoResponse | null>(null);
 
   const refresh = async () => {
     try {
@@ -38,6 +43,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setMe(null);
       setStatus('unauthenticated');
     });
+    // /info is unauthenticated and tells us which auth_mode the login form
+    // should render. Don't gate auth state on it — render OTP-only as a
+    // fallback if it 502s (e.g. upstream Sinas down).
+    client.auth.getInfo().then(setInfo).catch(() => setInfo(null));
     void refresh();
   }, []);
 
@@ -53,11 +62,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setStatus('unauthenticated');
     if (rt) {
       try {
-        await fetch('/api/v1/auth/logout', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ refresh_token: rt }),
-        });
+        await client.auth.logout(rt);
       } catch {
         // best effort
       }
@@ -65,7 +70,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   };
 
   return (
-    <AuthContext.Provider value={{ status, me, setSession, signOut, refresh }}>
+    <AuthContext.Provider value={{ status, me, info, setSession, signOut, refresh }}>
       {children}
     </AuthContext.Provider>
   );

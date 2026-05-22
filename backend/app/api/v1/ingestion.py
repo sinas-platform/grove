@@ -47,12 +47,18 @@ class PostUploadIn(BaseModel):
     # extraction step to populate the version's content.
     content_md: str | None = None
     metadata: dict | None = None
+    # If true, the document skips the auto-pipeline (classifier + extractors
+    # don't fire). Used for the discovery upload flow: drop docs in, scan
+    # them with discovery / FM-suggest, design the schema, then promote
+    # via an IngestionRun with staged_only=true.
+    staged: bool = False
 
 
 class PostUploadOut(BaseModel):
     document_id: uuid.UUID
     document_version_id: uuid.UUID
     version: int
+    staged: bool
 
 
 @router.post(
@@ -82,12 +88,15 @@ async def post_upload(
             collection_file_id=payload.collection_file_id,
             owner_id=caller.user_id,
             roles=caller.roles or [],
+            staged=payload.staged,
         )
         session.add(doc)
         await session.flush()
         version = 1
     else:
         doc = existing
+        # Re-uploading a doc keeps its current staged state. To unstage,
+        # use the promote IngestionRun path; to re-stage, edit directly.
         latest = (
             await session.execute(
                 select(DocumentVersion)
@@ -112,7 +121,12 @@ async def post_upload(
 
     doc.current_version_id = dv.id
     await session.commit()
-    return PostUploadOut(document_id=doc.id, document_version_id=dv.id, version=version)
+    return PostUploadOut(
+        document_id=doc.id,
+        document_version_id=dv.id,
+        version=version,
+        staged=doc.staged,
+    )
 
 
 # ─────────────────────────── classifier ───────────────────────────
@@ -136,6 +150,11 @@ async def set_document_class(
         raise HTTPException(status.HTTP_404_NOT_FOUND, "document not found")
     doc.document_class_id = payload.document_class_id
     doc.classification_confidence = payload.confidence
+    # Classifier-agent success is the canonical moment a doc enters the
+    # pipeline. Unstage here so the no-worker runner doesn't need a
+    # separate reconciliation step for it.
+    if doc.staged:
+        doc.staged = False
     await session.commit()
     return {"ok": True}
 

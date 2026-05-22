@@ -26,6 +26,18 @@ class RunFilter(BaseModel):
 
     document_ids: list[uuid.UUID] | None = None
     document_class_ids: list[uuid.UUID] | None = None
+    include_unclassified: bool = False
+    # Upper bound on classification_confidence — used to target the "doubtful"
+    # docs for reclassification. Combines additively with the class clauses
+    # (same OR group): "class A OR unclassified OR confidence ≤ 0.6".
+    max_classification_confidence: float | None = None
+    # Staged docs are uploaded but skipped the auto-pipeline. Two knobs:
+    #   include_staged=true → staged docs are added alongside the rest.
+    #   staged_only=true    → only staged docs (short-circuits the class group).
+    # Default behavior depends on the runner: ingestion excludes staged,
+    # discovery/FM-suggest includes staged.
+    include_staged: bool = False
+    staged_only: bool = False
     created_since: datetime | None = None
     created_until: datetime | None = None
 

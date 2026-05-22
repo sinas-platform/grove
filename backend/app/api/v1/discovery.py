@@ -36,14 +36,22 @@ from app.schemas.discovery import (
     DiscoveryRunCreateIn,
     DiscoveryRunCreateOut,
     DiscoveryRunOut,
+    FrontMatterSuggestIn,
+    FrontMatterSuggestOut,
     ProposalEditIn,
     ProposalMergeIn,
+    SuggestIn,
+    SuggestOut,
 )
 from app.services.discovery_runner import (
     expand_filter,
     materialize_run,
-    start_worker,
+    progress as discovery_progress,
+    submit_scan,
 )
+from app.services.front_matter_suggest import run_front_matter_suggest
+from sinas import SinasClient
+from app.config import get_settings
 
 router = APIRouter(prefix="/discovery", tags=["discovery"])
 
@@ -97,32 +105,217 @@ async def create_discovery_run(
     session.add(run)
     await session.flush()
     await materialize_run(session, run)
+    # Submit the scan batch synchronously, in this handler, using the
+    # caller's bearer. No background worker; subsequent state transitions
+    # are driven by GET /discovery/runs/{id} (live-fetch + atomic claim).
+    client = SinasClient(base_url=get_settings().sinas_url, token=caller.sinas_token)
+    await submit_scan(session, run, client)
     await session.commit()
-    start_worker()
     return DiscoveryRunCreateOut(
         run_id=run.id, document_count=count, sampled=sampled, status="started"
     )
 
 
+_FRONT_MATTER_KINDS: frozenset[str] = frozenset(
+    {"document_class", "document_class_property", "entity_type"}
+)
+
+
+@router.post(
+    "/suggest",
+    response_model=SuggestOut,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("grove.admin:all"))],
+)
+async def suggest(
+    payload: SuggestIn,
+    session: AsyncSession = Depends(get_session),
+    caller: CallerIdentity = Depends(get_caller),
+):
+    """Unified suggest pipeline: deterministic front-matter scan + LLM
+    discovery, both writing into the same proposal queue. The front-matter
+    pass runs synchronously (free, fast); the LLM run is queued for the
+    background worker."""
+    if payload.kind == "document_class_property" and payload.parent_class_id is None:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "parent_class_id is required for document_class_property suggest",
+        )
+
+    fm_run_id: uuid.UUID | None = None
+    fm_proposal_count = 0
+    fm_with_fm = 0
+    if payload.include_front_matter and payload.kind in _FRONT_MATTER_KINDS:
+        fm_run, _, fm_proposal_count, fm_with_fm = await run_front_matter_suggest(
+            session,
+            f=payload.filter,
+            sample_size=None,  # front-matter is cheap; scan everything matched
+            parent_class_id=payload.parent_class_id,
+            started_by=caller.user_id,
+        )
+        fm_run_id = fm_run.id
+
+    discovery_run_id: uuid.UUID | None = None
+    discovery_count = 0
+    discovery_sampled = False
+    if not payload.skip_llm:
+        count, sampled = await expand_filter(
+            session, payload.filter, payload.parent_class_id, payload.sample_size
+        )
+        if count == 0 and fm_run_id is None:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "filter selected zero documents",
+            )
+        if count > 0:
+            run = DiscoveryRun(
+                kind=payload.kind,
+                status="pending",
+                mode=payload.mode,
+                filter=payload.filter.model_dump(mode="json"),
+                parent_class_id=payload.parent_class_id,
+                sample_size=payload.sample_size,
+                total_docs=count,
+                scanned_docs=0,
+                failed_docs=0,
+                candidate_count=0,
+                proposal_count=0,
+                started_by=caller.user_id,
+                created_at=datetime.now(timezone.utc),
+            )
+            session.add(run)
+            await session.flush()
+            await materialize_run(session, run)
+            client = SinasClient(
+                base_url=get_settings().sinas_url, token=caller.sinas_token
+            )
+            await submit_scan(session, run, client)
+            await session.commit()
+            discovery_run_id = run.id
+            discovery_count = count
+            discovery_sampled = sampled
+
+    if fm_run_id is None and discovery_run_id is None:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "neither front-matter nor LLM discovery ran — check kind, "
+            "skip_llm, and include_front_matter flags",
+        )
+
+    return SuggestOut(
+        front_matter_run_id=fm_run_id,
+        front_matter_proposal_count=fm_proposal_count,
+        front_matter_documents_with_fm=fm_with_fm,
+        discovery_run_id=discovery_run_id,
+        discovery_document_count=discovery_count,
+        discovery_sampled=discovery_sampled,
+    )
+
+
+@router.post(
+    "/front-matter-suggest",
+    response_model=FrontMatterSuggestOut,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("grove.admin:all"))],
+)
+async def front_matter_suggest(
+    payload: FrontMatterSuggestIn,
+    session: AsyncSession = Depends(get_session),
+    caller: CallerIdentity = Depends(get_caller),
+):
+    """Synchronous front-matter scan. Parses YAML headers across the selected
+    docs, aggregates by key, and writes a completed DiscoveryRun with
+    DiscoveryCandidate + ConfigProposal rows for review."""
+    run, candidate_count, proposal_count, docs_with_fm = await run_front_matter_suggest(
+        session,
+        f=payload.filter,
+        sample_size=payload.sample_size,
+        parent_class_id=payload.parent_class_id,
+        started_by=caller.user_id,
+    )
+    return FrontMatterSuggestOut(
+        run_id=run.id,
+        document_count=run.total_docs,
+        documents_with_front_matter=docs_with_fm,
+        candidate_count=candidate_count,
+        proposal_count=proposal_count,
+    )
+
+
 @router.get("/runs", response_model=list[DiscoveryRunOut])
 async def list_discovery_runs(
-    limit: int = 50, session: AsyncSession = Depends(get_session)
+    limit: int = 50,
+    session: AsyncSession = Depends(get_session),
+    caller: CallerIdentity = Depends(get_caller),
 ):
-    rows = (
-        await session.execute(
-            select(DiscoveryRun).order_by(DiscoveryRun.created_at.desc()).limit(limit)
-        )
-    ).scalars().all()
+    """List recent discovery runs and drive in-flight runs forward.
+
+    The discovery RunsList view polls this endpoint every few seconds. For
+    any non-terminal run we run `progress(...)` so the user doesn't have to
+    open each run individually to advance its state (the per-run GET does
+    the same thing). Failures here are swallowed — they shouldn't take
+    the list endpoint down."""
+    rows = list(
+        (
+            await session.execute(
+                select(DiscoveryRun).order_by(DiscoveryRun.created_at.desc()).limit(limit)
+            )
+        ).scalars().all()
+    )
+    in_flight = [r for r in rows if r.status not in ("completed", "failed", "cancelled") and r.kind != "front_matter"]
+    if in_flight and caller.sinas_token:
+        client = SinasClient(base_url=get_settings().sinas_url, token=caller.sinas_token)
+        for r in in_flight:
+            try:
+                await discovery_progress(r, client)
+            except Exception as exc:  # noqa: BLE001
+                import logging as _log
+                _log.getLogger(__name__).warning(
+                    "discovery progress fetch failed for run %s: %s", r.id, exc
+                )
+        # Refresh rows so the response reflects any status transitions.
+        for r in rows:
+            await session.refresh(r)
     return rows
 
 
 @router.get("/runs/{run_id}", response_model=DiscoveryRunOut)
 async def get_discovery_run(
-    run_id: uuid.UUID, session: AsyncSession = Depends(get_session)
+    run_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    caller: CallerIdentity = Depends(get_caller),
 ):
+    """Returns the run row, **after** advancing its state from Sinas.
+
+    This is the only place run state advances — there's no background worker.
+    Each GET fetches live batch status; on terminal scan it reconciles units
+    and atomically fires the consolidator; on terminal consolidate it marks
+    the run completed.
+
+    Polling cadence is up to the caller (UI). Cheap: one or two batch GETs
+    per call.
+    """
     row = await session.get(DiscoveryRun, run_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "discovery run not found")
+    # Skip live-fetch for terminal runs — nothing to do.
+    if row.status in ("completed", "failed", "cancelled"):
+        return row
+    if row.kind == "front_matter":
+        # Synchronous run — no Sinas batch to track.
+        return row
+    client = SinasClient(base_url=get_settings().sinas_url, token=caller.sinas_token)
+    try:
+        await discovery_progress(row, client)
+    except Exception as exc:  # noqa: BLE001
+        # Don't fail the GET if Sinas is unreachable — return last-known state.
+        # Real issues will surface on next poll.
+        import logging as _log
+        _log.getLogger(__name__).warning(
+            "discovery progress fetch failed for run %s: %s", run_id, exc
+        )
+    # Re-read the row in case progress() mutated it.
+    await session.refresh(row)
     return row
 
 

@@ -1,87 +1,63 @@
+import { SinasClient } from '@sinas/sdk';
+
 const API_BASE = import.meta.env.VITE_GROVE_API ?? '/api/v1';
 
 const ACCESS_KEY = 'grove_access_token';
 const REFRESH_KEY = 'grove_refresh_token';
 
 export const tokens = {
-  get access() {
+  get access(): string | null {
     return localStorage.getItem(ACCESS_KEY);
   },
-  get refresh() {
+  get refresh(): string | null {
     return localStorage.getItem(REFRESH_KEY);
   },
-  set(access: string, refresh: string) {
+  set(access: string, refresh: string): void {
     localStorage.setItem(ACCESS_KEY, access);
     localStorage.setItem(REFRESH_KEY, refresh);
   },
-  clear() {
+  setAccess(access: string): void {
+    localStorage.setItem(ACCESS_KEY, access);
+  },
+  clear(): void {
     localStorage.removeItem(ACCESS_KEY);
     localStorage.removeItem(REFRESH_KEY);
   },
 };
 
-let refreshInFlight: Promise<string | null> | null = null;
-let onUnauthenticated: (() => void) | null = null;
+let unauthenticatedHandler: (() => void) | null = null;
 
-export function setUnauthenticatedHandler(fn: () => void) {
-  onUnauthenticated = fn;
+export function setUnauthenticatedHandler(fn: () => void): void {
+  unauthenticatedHandler = fn;
 }
 
-async function tryRefresh(): Promise<string | null> {
-  if (!tokens.refresh) return null;
-  if (refreshInFlight) return refreshInFlight;
-  refreshInFlight = (async () => {
-    try {
-      const res = await fetch(`${API_BASE}/auth/refresh`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ refresh_token: tokens.refresh }),
-      });
-      if (!res.ok) return null;
-      const body = (await res.json()) as { access_token: string };
-      // Refresh response only returns a new access token.
-      localStorage.setItem(ACCESS_KEY, body.access_token);
-      return body.access_token;
-    } catch {
-      return null;
-    } finally {
-      refreshInFlight = null;
-    }
-  })();
-  return refreshInFlight;
-}
+/**
+ * SinasClient configured against grove's /api/v1. Used for:
+ *   - auth (client.auth.login / verifyOTP / refresh / logout / getInfo)
+ *   - all grove-side data calls (via the `api<T>` helper below)
+ *
+ * Tokens are read fresh on every request so the client itself never
+ * goes stale across re-renders or refresh-token rotation.
+ */
+export const client = new SinasClient({
+  baseUrl: API_BASE,
+  getAccessToken: () => tokens.access,
+  getRefreshToken: () => tokens.refresh,
+  onTokenRefresh: (access) => tokens.setAccess(access),
+  onUnauthenticated: () => {
+    tokens.clear();
+    unauthenticatedHandler?.();
+  },
+});
 
-async function doFetch(path: string, init: RequestInit, accessToken: string | null): Promise<Response> {
-  const headers = new Headers(init.headers ?? {});
-  if (init.body && !headers.has('Content-Type')) {
-    headers.set('Content-Type', 'application/json');
-  }
-  if (accessToken) headers.set('Authorization', `Bearer ${accessToken}`);
-  return fetch(`${API_BASE}${path}`, { ...init, headers });
-}
-
+/**
+ * Thin helper for grove's own /api/v1/* endpoints. Reuses the SinasClient
+ * for headers + refresh-on-401, so 401s automatically trigger one refresh
+ * attempt before the request fails.
+ */
 export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
-  // Don't auto-refresh for the refresh endpoint itself.
-  const isAuthCall = path.startsWith('/auth/');
-
-  let res = await doFetch(path, init, tokens.access);
-
-  if (res.status === 401 && !isAuthCall) {
-    const fresh = await tryRefresh();
-    if (fresh) {
-      res = await doFetch(path, init, fresh);
-    }
-    if (res.status === 401) {
-      tokens.clear();
-      onUnauthenticated?.();
-      throw new Error('unauthenticated');
-    }
-  }
-
-  if (!res.ok) {
-    const text = await res.text().catch(() => '');
-    throw new Error(`${res.status} ${res.statusText}: ${text}`);
-  }
+  const url = `${API_BASE}${path}`;
+  const res = await client.fetch(url, init);
   if (res.status === 204) return undefined as T;
   return (await res.json()) as T;
 }

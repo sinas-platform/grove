@@ -79,6 +79,64 @@ const KIND_ORDER: Kind[] = [
   'document_class_property',
 ];
 
+const KIND_HELP: Record<Kind, { title: string; description: string }> = {
+  document_class: {
+    title: 'Document classes',
+    description:
+      'What kinds of documents are in this corpus? Use this first on a new corpus.',
+  },
+  document_class_property: {
+    title: 'Properties on a class',
+    description:
+      'Structured fields to extract from docs of a specific class (e.g. fine amount, decision date).',
+  },
+  entity_type: {
+    title: 'Entity types',
+    description: 'Named things that appear in docs (companies, courts, jurisdictions).',
+  },
+  relationship_definition: {
+    title: 'Relationships',
+    description: 'Connections between docs / entities (e.g. "doc cites doc", "company sued by").',
+  },
+  dossier_class: {
+    title: 'Dossier classes',
+    description: 'Kinds of dossiers (research containers). Only relevant if you use dossiers.',
+  },
+};
+
+type ScopePreset = 'all' | 'staged_only' | 'custom';
+
+// ─────────────────────── intro / help ───────────────────────
+function DiscoveryHelp() {
+  const counts = useQuery({
+    queryKey: ['documents-counts'],
+    queryFn: () =>
+      api<{ total: number; staged: number; unclassified: number }>('/documents/counts'),
+  });
+  const staged = counts.data?.staged ?? 0;
+
+  return (
+    <div className="mb-6 p-3 border border-stone-200 bg-stone-50 rounded text-sm text-stone-700">
+      <div className="font-medium mb-1">Typical flow</div>
+      <ol className="list-decimal list-inside text-xs text-stone-600 space-y-0.5">
+        <li>
+          Upload your corpus (staged is recommended for greenfield — skips the auto-pipeline).
+        </li>
+        <li>Discover <b>document classes</b> first to learn what kinds of docs are in the corpus.</li>
+        <li>Approve classes you like (in the tabs below). Promote staged docs once the schema looks right.</li>
+        <li>Per class, discover <b>properties</b> and <b>entity types</b> to fill out extraction.</li>
+        <li>Optionally: relationships, dossier classes.</li>
+      </ol>
+      {staged > 0 && (
+        <div className="mt-2 text-xs text-amber-800">
+          ⚠ <b>{staged}</b> staged doc{staged === 1 ? '' : 's'} pending. Discovery scans them
+          by default — use "Only staged docs" to scope to just those.
+        </div>
+      )}
+    </div>
+  );
+}
+
 export default function DiscoveryPage() {
   const [tab, setTab] = useState<Kind>('document_class');
   const [showNewRun, setShowNewRun] = useState(false);
@@ -87,13 +145,14 @@ export default function DiscoveryPage() {
     <div>
       <PageHeader
         title="Discovery"
-        description="Run agents over the corpus to suggest new document classes, entity types, relationships, dossier classes, or properties. Suggestions are deduplicated and shown here for review."
+        description="Suggest schema (classes, properties, entity types, relationships) from real corpus content. Front-matter scan finds it for free where YAML headers exist; LLM discovery reads document bodies. Proposals land in the tabs below for review."
         actions={
           <PrimaryButton onClick={() => setShowNewRun((v) => !v)}>
             {showNewRun ? 'Cancel' : 'New discovery run'}
           </PrimaryButton>
         }
       />
+      {!showNewRun && <DiscoveryHelp />}
 
       {showNewRun && <NewRunForm onClose={() => setShowNewRun(false)} />}
 
@@ -125,29 +184,83 @@ export default function DiscoveryPage() {
 function NewRunForm({ onClose }: { onClose: () => void }) {
   const qc = useQueryClient();
   const [kind, setKind] = useState<Kind>('document_class');
-  const [mode, setMode] = useState<Mode>('incremental');
+  const [scope, setScope] = useState<ScopePreset>('all');
+  const [showAdvanced, setShowAdvanced] = useState(false);
   const [parentClassId, setParentClassId] = useState<string>('');
   const [sampleSize, setSampleSize] = useState<string>('50');
   const [classFilter, setClassFilter] = useState<Set<string>>(new Set());
   const [createdSince, setCreatedSince] = useState<string>('');
+  const [includeUnclassified, setIncludeUnclassified] = useState(false);
+  const [maxConfidence, setMaxConfidence] = useState<string>('');
+  const [mode, setMode] = useState<Mode>('greenfield');
+  const [includeFrontMatter, setIncludeFrontMatter] = useState(true);
+  const [skipLlm, setSkipLlm] = useState(false);
   const [preview, setPreview] = useState<{ document_count: number; sampled: boolean } | null>(null);
+  const [lastResult, setLastResult] = useState<{
+    fm_proposals?: number;
+    fm_docs_with_fm?: number;
+    discovery_count?: number;
+    discovery_sampled?: boolean;
+  } | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  const fmEligible = kind === 'document_class' || kind === 'document_class_property' || kind === 'entity_type';
+  const useSuggestEndpoint = fmEligible && (includeFrontMatter || skipLlm);
+  const classFilterRelevant =
+    kind !== 'document_class' && kind !== 'document_class_property';
 
   const classes = useQuery({
     queryKey: ['document-classes'],
     queryFn: () => api<DocumentClass[]>('/config/document-classes'),
   });
 
+  const buildFilter = () => {
+    if (scope === 'staged_only') {
+      return {
+        staged_only: true,
+        include_unclassified: false,
+        max_classification_confidence: null,
+        document_class_ids: null,
+        created_since: null,
+      };
+    }
+    if (scope === 'all') {
+      // "All" means: don't constrain. Discovery includes staged docs by
+      // default already (see services/discovery_runner.py).
+      return {
+        document_class_ids: null,
+        include_unclassified: false,
+        max_classification_confidence: null,
+        created_since: null,
+      };
+    }
+    // custom
+    return {
+      document_class_ids:
+        classFilterRelevant && classFilter.size > 0 ? Array.from(classFilter) : null,
+      include_unclassified: includeUnclassified,
+      max_classification_confidence: maxConfidence ? Number(maxConfidence) : null,
+      created_since: createdSince ? new Date(createdSince).toISOString() : null,
+    };
+  };
+
   const buildBody = (dryRun: boolean) => ({
     kind,
     mode,
-    filter: {
-      document_class_ids: classFilter.size > 0 ? Array.from(classFilter) : null,
-      created_since: createdSince ? new Date(createdSince).toISOString() : null,
-    },
+    filter: buildFilter(),
     sample_size: sampleSize ? Number(sampleSize) : null,
     parent_class_id: kind === 'document_class_property' && parentClassId ? parentClassId : null,
     dry_run: dryRun,
+  });
+
+  const buildSuggestBody = () => ({
+    kind,
+    mode,
+    filter: buildFilter(),
+    sample_size: sampleSize ? Number(sampleSize) : null,
+    parent_class_id: kind === 'document_class_property' && parentClassId ? parentClassId : null,
+    include_front_matter: includeFrontMatter,
+    skip_llm: skipLlm,
   });
 
   const previewMutation = useMutation({
@@ -164,122 +277,369 @@ function NewRunForm({ onClose }: { onClose: () => void }) {
   });
 
   const submit = useMutation({
-    mutationFn: () =>
-      api<{ run_id: string }>('/discovery/runs', {
+    mutationFn: async () => {
+      if (useSuggestEndpoint) {
+        return api<{
+          front_matter_run_id: string | null;
+          front_matter_proposal_count: number;
+          front_matter_documents_with_fm: number;
+          discovery_run_id: string | null;
+          discovery_document_count: number;
+          discovery_sampled: boolean;
+        }>('/discovery/suggest', {
+          method: 'POST',
+          body: JSON.stringify(buildSuggestBody()),
+        });
+      }
+      return api<{ run_id: string }>('/discovery/runs', {
         method: 'POST',
         body: JSON.stringify(buildBody(false)),
-      }),
-    onSuccess: () => {
+      });
+    },
+    onSuccess: (res) => {
       setError(null);
       void qc.invalidateQueries({ queryKey: ['discovery-runs'] });
-      onClose();
+      void qc.invalidateQueries({ queryKey: ['proposals'] });
+      if (useSuggestEndpoint) {
+        const r = res as {
+          front_matter_run_id: string | null;
+          front_matter_proposal_count: number;
+          front_matter_documents_with_fm: number;
+          discovery_run_id: string | null;
+          discovery_document_count: number;
+          discovery_sampled: boolean;
+        };
+        setLastResult({
+          fm_proposals: r.front_matter_proposal_count,
+          fm_docs_with_fm: r.front_matter_documents_with_fm,
+          discovery_count: r.discovery_document_count,
+          discovery_sampled: r.discovery_sampled,
+        });
+        // Don't close — let the user see the FM result before LLM finishes.
+      } else {
+        onClose();
+      }
     },
     onError: (err) => setError(err instanceof Error ? err.message : 'failed'),
   });
 
   return (
-    <div className="mb-6 p-4 border border-forest-500 bg-forest-50 rounded space-y-3">
-      <div className="grid grid-cols-2 gap-3">
-        <Field label="Kind">
-          <select
-            value={kind}
-            onChange={(e) => {
-              setKind(e.target.value as Kind);
-              setPreview(null);
-            }}
-            className={inputClasses}
-          >
-            {KIND_ORDER.map((k) => (
-              <option key={k} value={k}>
-                {KIND_LABELS[k]}
-              </option>
-            ))}
-          </select>
-        </Field>
-        <Field label="Mode" hint="incremental skips already-configured items">
-          <select
-            value={mode}
-            onChange={(e) => setMode(e.target.value as Mode)}
-            className={inputClasses}
-          >
-            <option value="incremental">incremental</option>
-            <option value="greenfield">greenfield</option>
-          </select>
-        </Field>
-      </div>
-
-      {kind === 'document_class_property' && (
-        <Field label="Parent document class" hint="required for property discovery">
-          <select
-            value={parentClassId}
-            onChange={(e) => {
-              setParentClassId(e.target.value);
-              setPreview(null);
-            }}
-            className={inputClasses}
-          >
-            <option value="">(pick one)</option>
-            {(classes.data ?? []).map((c) => (
-              <option key={c.id} value={c.id}>
-                {c.name} ({c.slug})
-              </option>
-            ))}
-          </select>
-        </Field>
-      )}
-
-      <Field
-        label="Filter by document class (optional)"
-        hint={kind === 'document_class_property' ? 'ignored — parent class above is used' : 'leave empty to scan all'}
-      >
-        <div className="flex flex-wrap gap-2">
-          {(classes.data ?? []).map((c) => (
-            <button
-              key={c.id}
-              onClick={() => {
-                const n = new Set(classFilter);
-                if (n.has(c.id)) n.delete(c.id);
-                else n.add(c.id);
-                setClassFilter(n);
-                setPreview(null);
-              }}
-              className={`px-2 py-1 rounded border text-xs ${
-                classFilter.has(c.id)
-                  ? 'border-forest-500 bg-forest-50 text-forest-700'
-                  : 'border-stone-300 text-stone-700 hover:bg-stone-100'
+    <div className="mb-6 p-5 border border-forest-500 bg-forest-50 rounded space-y-6">
+      {/* ─── Section 1: what are you discovering ─── */}
+      <section>
+        <div className="text-xs font-semibold uppercase tracking-wider text-stone-500 mb-2">
+          1. What are you discovering?
+        </div>
+        <div className="space-y-1.5">
+          {KIND_ORDER.map((k) => (
+            <label
+              key={k}
+              className={`flex items-start gap-2.5 p-2 rounded border cursor-pointer transition-colors ${
+                kind === k
+                  ? 'border-forest-500 bg-white'
+                  : 'border-transparent hover:bg-white/60'
               }`}
             >
-              {c.name}
-            </button>
+              <input
+                type="radio"
+                name="kind"
+                value={k}
+                checked={kind === k}
+                onChange={() => {
+                  setKind(k);
+                  setPreview(null);
+                }}
+                className="mt-0.5"
+              />
+              <span className="flex-1">
+                <span className="font-medium text-sm text-stone-800">
+                  {KIND_HELP[k].title}
+                </span>
+                <span className="block text-xs text-stone-500 mt-0.5">
+                  {KIND_HELP[k].description}
+                </span>
+              </span>
+            </label>
           ))}
         </div>
-      </Field>
 
-      <div className="grid grid-cols-2 gap-3">
-        <Field label="Sample size" hint="random sample of N docs (blank = all)">
-          <input
-            type="number"
-            min="1"
-            value={sampleSize}
-            onChange={(e) => {
-              setSampleSize(e.target.value);
-              setPreview(null);
-            }}
-            className={inputClasses}
-          />
-        </Field>
-        <Field label="Created since (optional)">
-          <input
-            type="datetime-local"
-            value={createdSince}
-            onChange={(e) => {
-              setCreatedSince(e.target.value);
-              setPreview(null);
-            }}
-            className={inputClasses}
-          />
-        </Field>
-      </div>
+        {kind === 'document_class_property' && (
+          <div className="mt-3 pl-4 border-l-2 border-forest-300">
+            <Field
+              label="Parent document class"
+              hint="Properties belong to a class — pick which one"
+            >
+              <select
+                value={parentClassId}
+                onChange={(e) => {
+                  setParentClassId(e.target.value);
+                  setPreview(null);
+                }}
+                className={inputClasses}
+              >
+                <option value="">(pick one)</option>
+                {(classes.data ?? []).map((c) => (
+                  <option key={c.id} value={c.id}>
+                    {c.name} ({c.slug})
+                  </option>
+                ))}
+              </select>
+            </Field>
+          </div>
+        )}
+      </section>
+
+      {/* ─── Section 2: which documents ─── */}
+      <section>
+        <div className="text-xs font-semibold uppercase tracking-wider text-stone-500 mb-2">
+          2. Which documents?
+        </div>
+        <div className="space-y-1.5">
+          <label
+            className={`flex items-start gap-2.5 p-2 rounded border cursor-pointer transition-colors ${
+              scope === 'all' ? 'border-forest-500 bg-white' : 'border-transparent hover:bg-white/60'
+            }`}
+          >
+            <input
+              type="radio"
+              name="scope"
+              checked={scope === 'all'}
+              onChange={() => {
+                setScope('all');
+                setPreview(null);
+              }}
+              className="mt-0.5"
+            />
+            <span className="flex-1">
+              <span className="font-medium text-sm text-stone-800">All eligible docs</span>
+              <span className="block text-xs text-stone-500 mt-0.5">
+                Includes staged docs by default — discovery's whole job is reading them. Use this
+                first.
+              </span>
+            </span>
+          </label>
+          <label
+            className={`flex items-start gap-2.5 p-2 rounded border cursor-pointer transition-colors ${
+              scope === 'staged_only' ? 'border-forest-500 bg-white' : 'border-transparent hover:bg-white/60'
+            }`}
+          >
+            <input
+              type="radio"
+              name="scope"
+              checked={scope === 'staged_only'}
+              onChange={() => {
+                setScope('staged_only');
+                setPreview(null);
+              }}
+              className="mt-0.5"
+            />
+            <span className="flex-1">
+              <span className="font-medium text-sm text-stone-800">Only staged docs</span>
+              <span className="block text-xs text-stone-500 mt-0.5">
+                Just the newly-uploaded ones that haven't been processed yet. Use when iterating
+                on schema for a freshly-added batch.
+              </span>
+            </span>
+          </label>
+          <label
+            className={`flex items-start gap-2.5 p-2 rounded border cursor-pointer transition-colors ${
+              scope === 'custom' ? 'border-forest-500 bg-white' : 'border-transparent hover:bg-white/60'
+            }`}
+          >
+            <input
+              type="radio"
+              name="scope"
+              checked={scope === 'custom'}
+              onChange={() => {
+                setScope('custom');
+                setPreview(null);
+              }}
+              className="mt-0.5"
+            />
+            <span className="flex-1">
+              <span className="font-medium text-sm text-stone-800">Custom filter</span>
+              <span className="block text-xs text-stone-500 mt-0.5">
+                Narrow by class, confidence, date — show advanced filters below.
+              </span>
+            </span>
+          </label>
+        </div>
+
+        {scope === 'custom' && (
+          <div className="mt-3 pl-4 border-l-2 border-stone-300 space-y-3">
+            {classFilterRelevant && (
+              <Field label="Limit to docs of these classes (optional)">
+                <div className="flex flex-wrap gap-2">
+                  {(classes.data ?? []).map((c) => (
+                    <button
+                      key={c.id}
+                      onClick={() => {
+                        const n = new Set(classFilter);
+                        if (n.has(c.id)) n.delete(c.id);
+                        else n.add(c.id);
+                        setClassFilter(n);
+                        setPreview(null);
+                      }}
+                      className={`px-2 py-1 rounded border text-xs ${
+                        classFilter.has(c.id)
+                          ? 'border-forest-500 bg-forest-50 text-forest-700'
+                          : 'border-stone-300 text-stone-700 hover:bg-stone-100'
+                      }`}
+                    >
+                      {c.name}
+                    </button>
+                  ))}
+                </div>
+              </Field>
+            )}
+            <label className="flex items-center gap-2 text-sm text-stone-700">
+              <input
+                type="checkbox"
+                checked={includeUnclassified}
+                onChange={(e) => {
+                  setIncludeUnclassified(e.target.checked);
+                  setPreview(null);
+                }}
+              />
+              Include unclassified docs (no class assigned yet)
+            </label>
+            <div className="grid grid-cols-2 gap-3">
+              <Field
+                label="Max classification confidence"
+                hint="e.g. 0.6 to scan only doubtfully-classified docs"
+              >
+                <input
+                  type="number"
+                  min="0"
+                  max="1"
+                  step="0.05"
+                  placeholder="(no upper bound)"
+                  value={maxConfidence}
+                  onChange={(e) => {
+                    setMaxConfidence(e.target.value);
+                    setPreview(null);
+                  }}
+                  className={inputClasses}
+                />
+              </Field>
+              <Field label="Created since">
+                <input
+                  type="datetime-local"
+                  value={createdSince}
+                  onChange={(e) => {
+                    setCreatedSince(e.target.value);
+                    setPreview(null);
+                  }}
+                  className={inputClasses}
+                />
+              </Field>
+            </div>
+          </div>
+        )}
+
+        <div className="mt-3">
+          <Field
+            label="Sample size"
+            hint="Random sample of N docs to scan. Blank = scan every match. Lower = cheaper."
+          >
+            <input
+              type="number"
+              min="1"
+              value={sampleSize}
+              onChange={(e) => {
+                setSampleSize(e.target.value);
+                setPreview(null);
+              }}
+              className={inputClasses + ' max-w-[120px]'}
+            />
+          </Field>
+        </div>
+      </section>
+
+      {/* ─── Section 3: how thoroughly ─── */}
+      {fmEligible && (
+        <section>
+          <div className="text-xs font-semibold uppercase tracking-wider text-stone-500 mb-2">
+            3. How thoroughly?
+          </div>
+          <div className="space-y-1.5">
+            <label className="flex items-start gap-2 text-sm text-stone-700 p-2 rounded border border-transparent hover:bg-white/60">
+              <input
+                type="checkbox"
+                checked={includeFrontMatter}
+                onChange={(e) => setIncludeFrontMatter(e.target.checked)}
+                className="mt-0.5"
+              />
+              <span>
+                <span className="font-medium">Include front-matter scan</span>
+                <span className="block text-xs text-stone-500">
+                  Free, deterministic pre-pass on YAML headers. Recommended.
+                </span>
+              </span>
+            </label>
+            <label className="flex items-start gap-2 text-sm text-stone-700 p-2 rounded border border-transparent hover:bg-white/60">
+              <input
+                type="checkbox"
+                checked={skipLlm}
+                onChange={(e) => setSkipLlm(e.target.checked)}
+                className="mt-0.5"
+              />
+              <span>
+                <span className="font-medium">Skip LLM discovery (cost-saving)</span>
+                <span className="block text-xs text-stone-500">
+                  Run only front-matter — no LLM calls. Useful when YAML headers cover what you
+                  need.
+                </span>
+              </span>
+            </label>
+          </div>
+        </section>
+      )}
+
+      {/* ─── Advanced (collapsed) ─── */}
+      <section>
+        <button
+          onClick={() => setShowAdvanced((v) => !v)}
+          className="text-xs text-stone-500 hover:text-stone-800"
+        >
+          {showAdvanced ? '▼' : '▶'} Advanced
+        </button>
+        {showAdvanced && (
+          <div className="mt-2 pl-3 space-y-2 text-sm">
+            <Field
+              label="Discovery mode"
+              hint="greenfield: propose everything. incremental: skip what's already configured."
+            >
+              <select
+                value={mode}
+                onChange={(e) => setMode(e.target.value as Mode)}
+                className={inputClasses + ' max-w-[180px]'}
+              >
+                <option value="greenfield">greenfield</option>
+                <option value="incremental">incremental</option>
+              </select>
+            </Field>
+          </div>
+        )}
+      </section>
+
+      {/* ─── Results & preview ─── */}
+      {lastResult && (
+        <div className="text-sm text-stone-700 bg-white border border-forest-300 rounded px-3 py-2">
+          {lastResult.fm_proposals != null && (
+            <div>
+              Front-matter scan: <b>{lastResult.fm_proposals}</b> proposal(s) from{' '}
+              <b>{lastResult.fm_docs_with_fm}</b> docs with YAML headers.
+            </div>
+          )}
+          {lastResult.discovery_count != null && lastResult.discovery_count > 0 && (
+            <div>
+              LLM discovery queued: <b>{lastResult.discovery_count}</b> doc(s) to scan
+              {lastResult.discovery_sampled && ' (sampled)'} — watch progress above.
+            </div>
+          )}
+        </div>
+      )}
 
       {preview && (
         <div className="text-sm text-stone-700 bg-white border border-stone-200 rounded px-3 py-2">
@@ -288,12 +648,12 @@ function NewRunForm({ onClose }: { onClose: () => void }) {
         </div>
       )}
       <ErrorBanner message={error} />
-      <div className="flex gap-2">
+      <div className="flex gap-2 pt-2 border-t border-stone-200">
         <SecondaryButton onClick={() => previewMutation.mutate()}>
           {previewMutation.isPending ? 'Counting…' : 'Preview count'}
         </SecondaryButton>
         <PrimaryButton onClick={() => submit.mutate()} disabled={submit.isPending}>
-          {submit.isPending ? 'Starting…' : 'Start run'}
+          {submit.isPending ? 'Starting…' : 'Start discovery'}
         </PrimaryButton>
         <SecondaryButton onClick={onClose}>Close</SecondaryButton>
       </div>

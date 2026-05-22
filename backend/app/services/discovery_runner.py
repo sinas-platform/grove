@@ -1,17 +1,22 @@
-"""Discovery runner — bulk config-suggestion pipeline.
+"""Discovery — no-worker design.
 
 Lifecycle:
-  pending → scanning → consolidating → completed | failed | cancelled
+  pending → scanning → consolidating → completed | failed
 
-Stages:
-  1. Scan: invoke `grove/discovery-agent` per doc, with `kind` in the input.
-     Agent emits raw `discovery_candidate` rows via the connector.
-  2. Consolidate: once all per-doc units are done, invoke
-     `grove/discovery-consolidator-agent` once with the run_id. It reads all
-     candidates for the run, clusters duplicates, and emits `config_proposal`
-     rows via the connector.
+Flow:
+  - `POST /discovery/runs` calls `submit_scan(...)` inside the request handler.
+    The user's bearer is in scope, so we hit Sinas's batch endpoint as the
+    originating user. The scan batch_id is persisted on the run; the run
+    transitions to "scanning".
+  - `GET /discovery/runs/{id}` calls `progress(...)` which live-fetches batch
+    status from Sinas and drives the run forward atomically:
+      * scan batch terminal → submit consolidate batch (single-item agent batch)
+      * consolidate batch terminal → mark run completed, store final counts
+  - No background workers, no persisted user tokens. The polling is driven
+    by the UI's progress requests, which always carry a fresh user bearer.
 
-The runner reuses the same single-process worker pattern as ingestion_runner.
+See ADR docs/adrs/2026-05-14-stateful-filter-on-result.md? No — this is the
+batch-submission design from sinas/.../2026-05-14-external-app-bulk-enqueue.md.
 """
 
 from __future__ import annotations
@@ -25,10 +30,9 @@ from typing import Any
 
 from sinas import SinasClient
 from sinas.exceptions import SinasAPIError
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import get_settings
 from app.db import AsyncSessionLocal
 from app.models import (
     ConfigProposal,
@@ -38,7 +42,6 @@ from app.models import (
     Document,
 )
 from app.schemas.ingestion import RunFilter
-from app.services.sinas import get_admin_client
 
 log = logging.getLogger(__name__)
 
@@ -55,6 +58,14 @@ KIND_TO_AGENT = {
 CONSOLIDATOR_AGENT = ("grove", "discovery-consolidator-agent")
 
 
+_TERMINAL_BATCH_STATUSES = {"completed", "partial", "failed", "cancelled"}
+
+
+# ─────────────────────────────────────────────────────────────
+# Document selection (shared with front-matter suggest)
+# ─────────────────────────────────────────────────────────────
+
+
 async def _select_documents(
     session: AsyncSession,
     f: RunFilter,
@@ -64,13 +75,30 @@ async def _select_documents(
     stmt = select(Document.id)
     if f.document_ids:
         stmt = stmt.where(Document.id.in_(f.document_ids))
-    if f.document_class_ids:
-        stmt = stmt.where(Document.document_class_id.in_(f.document_class_ids))
+    if f.staged_only:
+        stmt = stmt.where(Document.staged.is_(True))
+    else:
+        class_clauses = []
+        if f.document_class_ids:
+            class_clauses.append(Document.document_class_id.in_(f.document_class_ids))
+        if f.include_unclassified:
+            class_clauses.append(Document.document_class_id.is_(None))
+        if f.max_classification_confidence is not None:
+            class_clauses.append(
+                Document.classification_confidence <= f.max_classification_confidence
+            )
+        if class_clauses:
+            stmt = stmt.where(or_(*class_clauses))
+        # Discovery and FM-suggest read staged docs unconditionally — that's
+        # their primary use case. The `include_staged` filter knob is ignored
+        # on this path. Users wanting to scope to already-processed docs
+        # should use document_class_ids (which excludes staged implicitly,
+        # since staged docs have no class) or staged_only=true for the
+        # opposite scope.
     if f.created_since:
         stmt = stmt.where(Document.created_at >= f.created_since)
     if f.created_until:
         stmt = stmt.where(Document.created_at <= f.created_until)
-    # Property discovery is scoped to a parent class.
     if parent_class_id is not None:
         stmt = stmt.where(Document.document_class_id == parent_class_id)
     rows = list((await session.execute(stmt)).scalars().all())
@@ -87,16 +115,15 @@ async def expand_filter(
     parent_class_id: uuid.UUID | None,
     sample_size: int | None,
 ) -> tuple[int, bool]:
-    """Returns (count_to_scan, was_sampled)."""
+    """Returns (count_to_scan, was_sampled). Called by the API to preview."""
     docs = await _select_documents(session, f, parent_class_id, sample_size)
     return len(docs), sample_size is not None and len(docs) >= sample_size
 
 
 async def materialize_run(session: AsyncSession, run: DiscoveryRun) -> int:
+    """Insert DiscoveryRunUnit rows for the selected docs. Returns count."""
     f = RunFilter(**(run.filter or {}))
-    doc_ids = await _select_documents(
-        session, f, run.parent_class_id, run.sample_size
-    )
+    doc_ids = await _select_documents(session, f, run.parent_class_id, run.sample_size)
     now = datetime.now(timezone.utc)
     units = [
         DiscoveryRunUnit(
@@ -112,295 +139,287 @@ async def materialize_run(session: AsyncSession, run: DiscoveryRun) -> int:
     return len(units)
 
 
-def _invoke_discovery_sync(
-    client: SinasClient,
-    namespace: str,
-    agent_name: str,
-    *,
-    run_id: uuid.UUID,
-    kind: str,
-    mode: str,
-    document_id: uuid.UUID,
-    parent_class_id: uuid.UUID | None,
-) -> dict[str, Any]:
-    return client.chats.invoke(
-        namespace=namespace,
-        agent_name=agent_name,
-        message=(
-            f"Discovery pass — kind '{kind}' (mode '{mode}'). Read document "
-            f"{document_id} and submit any candidate {kind}s you find via "
-            "submit_discovery_candidate. Be conservative with confidence."
-        ),
-        input={
-            "run_id": str(run_id),
-            "kind": kind,
-            "mode": mode,
-            "document_id": str(document_id),
-            **(
-                {"parent_class_id": str(parent_class_id)}
-                if parent_class_id is not None
-                else {}
+# ─────────────────────────────────────────────────────────────
+# Submission (called from POST /discovery/runs)
+# ─────────────────────────────────────────────────────────────
+
+
+def _build_scan_inputs(run: DiscoveryRun, doc_ids: list[uuid.UUID]) -> list[dict[str, Any]]:
+    # input_variables are rendered into the agent's system prompt via Jinja
+    # (see sinas message_service.py). The discovery-agent's system prompt
+    # references {{ run_id }}, {{ kind }}, etc., so the LLM gets the run
+    # context as part of its instructions rather than via the user message.
+    return [
+        {
+            "input_variables": {
+                "run_id": str(run.id),
+                "kind": run.kind,
+                "mode": run.mode,
+                "document_id": str(doc_id),
+                **(
+                    {"parent_class_id": str(run.parent_class_id)}
+                    if run.parent_class_id is not None
+                    else {}
+                ),
+            },
+            "message": (
+                f"Read document {doc_id} and submit any candidate {run.kind}s "
+                "you find via submit_discovery_candidate. Be conservative "
+                "with confidence."
             ),
-        },
-    )
-
-
-def _invoke_consolidator_sync(
-    client: SinasClient, run_id: uuid.UUID, kind: str
-) -> dict[str, Any]:
-    namespace, agent_name = CONSOLIDATOR_AGENT
-    return client.chats.invoke(
-        namespace=namespace,
-        agent_name=agent_name,
-        message=(
-            f"Consolidate the discovery candidates for run {run_id} (kind '{kind}'). "
-            "Cluster semantic duplicates, choose canonical names, and submit the "
-            "deduplicated proposals via submit_consolidated_proposal. Each proposal "
-            "must list the supporting candidate ids that were folded into it."
-        ),
-        input={"run_id": str(run_id), "kind": kind},
-    )
-
-
-async def _process_unit(
-    unit: DiscoveryRunUnit, run: DiscoveryRun, client: SinasClient
-) -> tuple[bool, str | None, str | None]:
-    namespace, agent_name = KIND_TO_AGENT[run.kind]
-    try:
-        result = await asyncio.to_thread(
-            _invoke_discovery_sync,
-            client,
-            namespace,
-            agent_name,
-            run_id=run.id,
-            kind=run.kind,
-            mode=run.mode,
-            document_id=unit.document_id,
-            parent_class_id=run.parent_class_id,
-        )
-    except SinasAPIError as exc:
-        return False, f"sinas: {exc}", None
-    except Exception as exc:  # noqa: BLE001
-        return False, f"{type(exc).__name__}: {exc}", None
-    chat_id = result.get("chat_id") if isinstance(result, dict) else None
-    return True, None, chat_id
-
-
-async def _claim_next_pending_unit(
-    session: AsyncSession, run_id: uuid.UUID
-) -> DiscoveryRunUnit | None:
-    row = (
-        await session.execute(
-            select(DiscoveryRunUnit)
-            .where(DiscoveryRunUnit.run_id == run_id)
-            .where(DiscoveryRunUnit.status == "pending")
-            .order_by(DiscoveryRunUnit.created_at)
-            .limit(1)
-            .with_for_update(skip_locked=True)
-        )
-    ).scalar_one_or_none()
-    if row is None:
-        return None
-    row.status = "running"
-    row.started_at = datetime.now(timezone.utc)
-    row.attempts += 1
-    await session.commit()
-    return row
-
-
-async def _run_scan_phase(run_id: uuid.UUID) -> None:
-    settings = get_settings()
-    sem = asyncio.Semaphore(settings.grove_rerun_concurrency)
-    client = get_admin_client()
-
-    # Cache the run shape — the units all share kind/mode/parent.
-    async with AsyncSessionLocal() as session:
-        run = await session.get(DiscoveryRun, run_id)
-        if run is None:
-            return
-
-    async def worker() -> None:
-        while True:
-            async with AsyncSessionLocal() as session:
-                unit = await _claim_next_pending_unit(session, run_id)
-            if unit is None:
-                return
-            async with sem:
-                ok, err, chat_id = await _process_unit(unit, run, client)
-            async with AsyncSessionLocal() as session:
-                u = await session.get(DiscoveryRunUnit, unit.id)
-                if u is None:
-                    continue
-                u.status = "succeeded" if ok else "failed"
-                u.error = err
-                u.chat_id = chat_id
-                u.completed_at = datetime.now(timezone.utc)
-                r = await session.get(DiscoveryRun, run_id)
-                if r is not None:
-                    r.scanned_docs += 1
-                    if not ok:
-                        r.failed_docs += 1
-                await session.commit()
-
-    workers = [
-        asyncio.create_task(worker()) for _ in range(settings.grove_rerun_concurrency)
+        }
+        for doc_id in doc_ids
     ]
-    await asyncio.gather(*workers, return_exceptions=False)
 
 
-async def _run_consolidate_phase(run_id: uuid.UUID) -> None:
-    client = get_admin_client()
-    async with AsyncSessionLocal() as session:
-        run = await session.get(DiscoveryRun, run_id)
-        if run is None:
-            return
-        run.status = "consolidating"
-        run.consolidating_at = datetime.now(timezone.utc)
-        await session.commit()
-        kind = run.kind
-    try:
-        await asyncio.to_thread(_invoke_consolidator_sync, client, run_id, kind)
-    except Exception as exc:  # noqa: BLE001
+async def submit_scan(
+    session: AsyncSession, run: DiscoveryRun, client: SinasClient
+) -> None:
+    """Submit the scan batch to Sinas. Called from the request handler that
+    holds the user's bearer. Updates the run row in-place; caller commits."""
+    units = list(
+        (
+            await session.execute(
+                select(DiscoveryRunUnit)
+                .where(DiscoveryRunUnit.run_id == run.id)
+                .order_by(DiscoveryRunUnit.created_at)
+            )
+        ).scalars().all()
+    )
+    if not units:
+        run.status = "completed"
+        run.completed_at = datetime.now(timezone.utc)
+        return
+
+    namespace, agent_name = KIND_TO_AGENT[run.kind]
+    inputs = _build_scan_inputs(run, [u.document_id for u in units])
+
+    result = await asyncio.to_thread(
+        client.agents.submit_batch,
+        namespace=namespace,
+        name=agent_name,
+        inputs=inputs,
+        trigger_id_prefix=f"grove:discovery:{run.id}",
+    )
+
+    batch_id = result["batch_id"]
+    execution_ids = result.get("execution_ids") or []
+    chat_ids = result.get("chat_ids") or []
+
+    run.sinas_batch_ids = {**(run.sinas_batch_ids or {}), "scan": batch_id}
+    run.status = "scanning"
+    run.started_at = datetime.now(timezone.utc)
+
+    now = datetime.now(timezone.utc)
+    for idx, u in enumerate(units):
+        u.status = "running"
+        u.started_at = now
+        u.attempts += 1
+        if idx < len(execution_ids):
+            u.sinas_execution_id = execution_ids[idx]
+        if idx < len(chat_ids):
+            u.chat_id = chat_ids[idx]
+
+
+# ─────────────────────────────────────────────────────────────
+# Progress (called from GET /discovery/runs/{id})
+# ─────────────────────────────────────────────────────────────
+
+
+async def _reconcile_units_from_batch(
+    client: SinasClient, run_id: uuid.UUID, batch_id: str
+) -> None:
+    """Drill into per-execution status and propagate to unit rows."""
+    offset = 0
+    while True:
+        executions = await asyncio.to_thread(
+            client.batches.list_executions, batch_id, limit=500, offset=offset
+        )
+        if not executions:
+            break
         async with AsyncSessionLocal() as session:
-            run = await session.get(DiscoveryRun, run_id)
-            if run is not None:
-                run.status = "failed"
-                run.error = f"consolidation: {type(exc).__name__}: {exc}"
-                run.completed_at = datetime.now(timezone.utc)
-                await session.commit()
-        raise
-
-
-async def _execute_run(run_id: uuid.UUID) -> None:
-    async with AsyncSessionLocal() as session:
-        run = await session.get(DiscoveryRun, run_id)
-        if run is None:
-            return
-        if run.status != "scanning":
-            run.status = "scanning"
-            run.started_at = datetime.now(timezone.utc)
+            for execution in executions:
+                exec_id = execution.get("execution_id") or execution.get("id")
+                if exec_id is None:
+                    continue
+                unit = (
+                    await session.execute(
+                        select(DiscoveryRunUnit)
+                        .where(DiscoveryRunUnit.sinas_execution_id == exec_id)
+                        .where(DiscoveryRunUnit.run_id == run_id)
+                    )
+                ).scalar_one_or_none()
+                if unit is None:
+                    continue
+                exec_status = (execution.get("status") or "").upper()
+                ok = exec_status == "COMPLETED"
+                unit.status = "succeeded" if ok else "failed"
+                if not ok:
+                    unit.error = execution.get("error") or f"sinas: {exec_status}"
+                unit.chat_id = execution.get("chat_id") or unit.chat_id
+                unit.completed_at = datetime.now(timezone.utc)
             await session.commit()
+        if len(executions) < 500:
+            break
+        offset += 500
 
-    # Phase 1: scan
-    await _run_scan_phase(run_id)
 
-    # Phase 2: consolidate (single agent invocation)
-    await _run_consolidate_phase(run_id)
+async def _claim_consolidate_transition(run_id: uuid.UUID) -> bool:
+    """Atomically transition the run into consolidating phase. Returns True if
+    THIS call won the race (and should submit the consolidator), False if
+    another GET already did."""
+    now = datetime.now(timezone.utc)
+    async with AsyncSessionLocal() as session:
+        result = await session.execute(
+            update(DiscoveryRun)
+            .where(DiscoveryRun.id == run_id)
+            .where(DiscoveryRun.consolidating_at.is_(None))
+            .values(status="consolidating", consolidating_at=now)
+        )
+        await session.commit()
+        return result.rowcount > 0
 
-    # Mark completed
+
+async def _submit_consolidator(
+    run_id: uuid.UUID, kind: str, client: SinasClient
+) -> None:
+    """Submit a single-item batch to the consolidator. Stored on the run as
+    `sinas_batch_ids["consolidate"]`."""
+    namespace, agent_name = CONSOLIDATOR_AGENT
+    result = await asyncio.to_thread(
+        client.agents.submit_batch,
+        namespace=namespace,
+        name=agent_name,
+        inputs=[
+            {
+                "input_variables": {"run_id": str(run_id), "kind": kind},
+                "message": (
+                    "Consolidate the candidates for this run. Cluster semantic "
+                    "duplicates, choose canonical names, and submit deduplicated "
+                    "proposals via submit_consolidated_proposal. Each proposal "
+                    "must list the supporting candidate ids it folds in."
+                ),
+            }
+        ],
+        trigger_id_prefix=f"grove:discovery:{run_id}:consolidate",
+    )
+    batch_id = result["batch_id"]
     async with AsyncSessionLocal() as session:
         run = await session.get(DiscoveryRun, run_id)
         if run is not None:
-            cand_count = (
-                await session.execute(
-                    select(func.count())
-                    .select_from(DiscoveryCandidate)
-                    .where(DiscoveryCandidate.run_id == run_id)
-                )
-            ).scalar_one()
-            run.candidate_count = int(cand_count)
-            prop_count = (
-                await session.execute(
-                    select(func.count())
-                    .select_from(ConfigProposal)
-                    .where(ConfigProposal.discovery_run_id == run_id)
-                )
-            ).scalar_one()
-            run.proposal_count = int(prop_count)
-            run.status = "completed"
-            run.completed_at = datetime.now(timezone.utc)
+            run.sinas_batch_ids = {
+                **(run.sinas_batch_ids or {}),
+                "consolidate": batch_id,
+            }
             await session.commit()
 
 
-# ────────────────────── background worker loop ──────────────────────
-_worker_task: asyncio.Task | None = None
-_shutdown = asyncio.Event()
-
-
-async def _claim_next_run() -> uuid.UUID | None:
+async def _mark_completed(run_id: uuid.UUID) -> None:
+    """Final reconcile when consolidate batch is terminal: update aggregate
+    counts and set status to completed."""
     async with AsyncSessionLocal() as session:
-        row = (
+        run = await session.get(DiscoveryRun, run_id)
+        if run is None or run.status == "completed":
+            return
+        cand_count = (
             await session.execute(
-                select(DiscoveryRun)
-                .where(DiscoveryRun.status == "pending")
-                .order_by(DiscoveryRun.created_at)
-                .limit(1)
-                .with_for_update(skip_locked=True)
+                select(func.count())
+                .select_from(DiscoveryCandidate)
+                .where(DiscoveryCandidate.run_id == run_id)
             )
-        ).scalar_one_or_none()
-        if row is None:
-            return None
-        row.status = "scanning"
-        row.started_at = datetime.now(timezone.utc)
-        await session.commit()
-        return row.id
-
-
-async def _resume_running_runs() -> list[uuid.UUID]:
-    async with AsyncSessionLocal() as session:
-        runs = (
+        ).scalar_one()
+        run.candidate_count = int(cand_count)
+        prop_count = (
             await session.execute(
-                select(DiscoveryRun.id).where(
-                    DiscoveryRun.status.in_(["scanning", "consolidating"])
+                select(func.count())
+                .select_from(ConfigProposal)
+                .where(ConfigProposal.discovery_run_id == run_id)
+            )
+        ).scalar_one()
+        run.proposal_count = int(prop_count)
+        scanned = int(
+            (
+                await session.execute(
+                    select(func.count())
+                    .select_from(DiscoveryRunUnit)
+                    .where(DiscoveryRunUnit.run_id == run_id)
+                    .where(DiscoveryRunUnit.status.in_(["succeeded", "failed"]))
                 )
-            )
-        ).scalars().all()
-        for run_id in runs:
-            await session.execute(
-                DiscoveryRunUnit.__table__.update()
-                .where(DiscoveryRunUnit.run_id == run_id)
-                .where(DiscoveryRunUnit.status == "running")
-                .values(status="pending")
-            )
+            ).scalar_one()
+        )
+        failed = int(
+            (
+                await session.execute(
+                    select(func.count())
+                    .select_from(DiscoveryRunUnit)
+                    .where(DiscoveryRunUnit.run_id == run_id)
+                    .where(DiscoveryRunUnit.status == "failed")
+                )
+            ).scalar_one()
+        )
+        run.scanned_docs = scanned
+        run.failed_docs = failed
+        run.status = "completed"
+        run.completed_at = datetime.now(timezone.utc)
         await session.commit()
-        return list(runs)
 
 
-async def _worker_loop() -> None:
-    log.info("discovery-runner worker started")
-    resumed = await _resume_running_runs()
-    for run_id in resumed:
-        log.info("resuming discovery run %s", run_id)
-        try:
-            await _execute_run(run_id)
-        except Exception as exc:  # noqa: BLE001
-            log.exception("resumed discovery run %s crashed: %s", run_id, exc)
+async def progress(run: DiscoveryRun, client: SinasClient) -> dict[str, Any]:
+    """Drive the run forward and return a status snapshot.
 
-    while not _shutdown.is_set():
-        run_id = await _claim_next_run()
-        if run_id is None:
-            try:
-                await asyncio.wait_for(_shutdown.wait(), timeout=2.0)
-            except asyncio.TimeoutError:
-                pass
-            continue
-        log.info("starting discovery run %s", run_id)
-        try:
-            await _execute_run(run_id)
-        except Exception as exc:  # noqa: BLE001
-            log.exception("discovery run %s crashed: %s", run_id, exc)
-            async with AsyncSessionLocal() as session:
-                run = await session.get(DiscoveryRun, run_id)
-                if run is not None and run.status not in ("completed", "failed"):
-                    run.status = "failed"
-                    run.error = f"{type(exc).__name__}: {exc}"
-                    run.completed_at = datetime.now(timezone.utc)
-                    await session.commit()
-    log.info("discovery-runner worker stopped")
+    Called from `GET /discovery/runs/{id}`. The caller's bearer is forwarded
+    to Sinas via the provided client.
+    """
+    batch_ids = dict(run.sinas_batch_ids or {})
+    scan_batch_id = batch_ids.get("scan")
+    consolidate_batch_id = batch_ids.get("consolidate")
 
+    snapshot: dict[str, Any] = {
+        "status": run.status,
+        "scan": None,
+        "consolidate": None,
+    }
 
-def start_worker() -> asyncio.Task:
-    global _worker_task
-    if _worker_task is None or _worker_task.done():
-        _shutdown.clear()
-        _worker_task = asyncio.create_task(_worker_loop(), name="discovery-runner")
-    return _worker_task
+    if scan_batch_id:
+        scan_status = await asyncio.to_thread(client.batches.get, scan_batch_id)
+        snapshot["scan"] = scan_status
+        scan_terminal = scan_status.get("status") in _TERMINAL_BATCH_STATUSES
 
+        if scan_terminal and run.status == "scanning":
+            # Reconcile unit rows once.
+            await _reconcile_units_from_batch(client, run.id, scan_batch_id)
+            # Atomically claim the consolidate transition.
+            won = await _claim_consolidate_transition(run.id)
+            if won:
+                try:
+                    await _submit_consolidator(run.id, run.kind, client)
+                except SinasAPIError as exc:
+                    async with AsyncSessionLocal() as s:
+                        r = await s.get(DiscoveryRun, run.id)
+                        if r is not None:
+                            r.status = "failed"
+                            r.error = f"consolidate submit: {exc}"
+                            r.completed_at = datetime.now(timezone.utc)
+                            await s.commit()
+                    snapshot["status"] = "failed"
+                    return snapshot
+            # Refresh run state for the rest of this call.
+            async with AsyncSessionLocal() as s:
+                run = await s.get(DiscoveryRun, run.id)
+                if run is None:
+                    return snapshot
+                batch_ids = dict(run.sinas_batch_ids or {})
+                consolidate_batch_id = batch_ids.get("consolidate")
+                snapshot["status"] = run.status
 
-async def stop_worker() -> None:
-    _shutdown.set()
-    if _worker_task is not None:
-        try:
-            await asyncio.wait_for(_worker_task, timeout=5.0)
-        except (asyncio.TimeoutError, asyncio.CancelledError):
-            _worker_task.cancel()
+    if consolidate_batch_id:
+        cons_status = await asyncio.to_thread(client.batches.get, consolidate_batch_id)
+        snapshot["consolidate"] = cons_status
+        if (
+            cons_status.get("status") in _TERMINAL_BATCH_STATUSES
+            and run.status != "completed"
+        ):
+            await _mark_completed(run.id)
+            snapshot["status"] = "completed"
+
+    return snapshot

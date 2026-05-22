@@ -34,6 +34,11 @@ class DiscoveryRun(Base):
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     consolidating_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Sinas batch_ids per phase ("scan", "consolidate"). Empty until
+    # submit_scan runs in the POST handler.
+    sinas_batch_ids: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default="{}"
+    )
 
 
 class DiscoveryRunUnit(Base):
@@ -50,6 +55,7 @@ class DiscoveryRunUnit(Base):
     error: Mapped[str | None] = mapped_column(Text)
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     chat_id: Mapped[str | None] = mapped_column(String(64))
+    sinas_execution_id: Mapped[str | None] = mapped_column(String(64))
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

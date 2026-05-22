@@ -9,7 +9,7 @@ metadata:
 
 package:
   name: sinas-grove
-  version: "0.1.8"
+  version: "0.1.9"
   description: >
     Sinas Grove — stateful, multi-agent document indexing and retrieval. The
     runtime is generic; domain knowledge (document classes, properties,
@@ -175,14 +175,21 @@ spec:
         - name: read_document_content
           method: GET
           path: /api/v1/documents/{{ doc_id }}/versions/{{ version }}/content
+          requestBodyMapping: query
           parameters:
             type: object
             properties:
               doc_id: { type: string, format: uuid }
               version: { type: integer }
-              line_from: { type: integer }
-              line_to: { type: integer }
+              line_from: { type: integer, minimum: 1 }
+              line_to: { type: integer, minimum: 1 }
             required: [doc_id, version]
+          description: |
+            Read document content. Returns at most ~500 lines per call to
+            keep tool responses small. The response includes `total_lines`,
+            `line_from`, `line_to`, and `next_line` — if `next_line` is
+            non-null, call again with `line_from=<next_line>` to continue
+            reading.
 
         - name: get_property_values
           method: GET
@@ -360,6 +367,324 @@ spec:
               reason: { type: string }
               added_by_agent: { type: string }
             required: [result_id, document_ids]
+          description: Add documents to the draft result. Pair with a reason; the agent's prior `append_trace` or its own narrative is the audit trail.
+
+        - name: remove_files_from_result
+          method: POST
+          path: /api/v1/retrieval/results/{{ result_id }}/files/remove
+          parameters:
+            type: object
+            properties:
+              result_id: { type: string, format: uuid }
+              document_ids:
+                type: array
+                items: { type: string, format: uuid }
+              reason: { type: string }
+            required: [result_id, document_ids]
+          description: Remove specific documents from the draft result. Server auto-traces.
+
+        - name: clear_result_files
+          method: POST
+          path: /api/v1/retrieval/results/{{ result_id }}/files/clear
+          parameters:
+            type: object
+            properties:
+              result_id: { type: string, format: uuid }
+            required: [result_id]
+          description: Drop all documents from the draft result. Rare — used when restarting the selection.
+
+        # ── filter mutations on the draft Result ──
+        # All filter ops carry filter_version (optimistic concurrency); the
+        # server auto-writes a result_trace row with before/after state and
+        # candidate-count delta. The agent does NOT need to call append_trace
+        # for these mutations — only for narrative entries (reasoning).
+
+        - name: introspect_by_result
+          method: POST
+          path: /api/v1/retrieval/results/{{ result_id }}/introspect
+          parameters:
+            type: object
+            properties:
+              result_id: { type: string, format: uuid }
+              fields:
+                type: array
+                items: { type: string }
+              top_k: { type: integer, default: 25 }
+              overlay:
+                type: object
+                description: Optional ephemeral filter overlay for what-if probes; not persisted.
+            required: [result_id]
+          description: Run introspect against the persisted filter on this result. Preferred over the stateless `/introspect` once a draft Result exists — the filter is not re-emitted on the wire.
+
+        - name: set_document_class_filter
+          method: POST
+          path: /api/v1/retrieval/results/{{ result_id }}/filter/document-class/set
+          parameters:
+            type: object
+            properties:
+              result_id: { type: string, format: uuid }
+              filter_version: { type: integer }
+              document_class_id: { type: string, format: uuid }
+            required: [result_id, filter_version, document_class_id]
+          description: Scope this result to one DocumentClass.
+
+        - name: clear_document_class_filter
+          method: POST
+          path: /api/v1/retrieval/results/{{ result_id }}/filter/document-class/clear
+          parameters:
+            type: object
+            properties:
+              result_id: { type: string, format: uuid }
+              filter_version: { type: integer }
+            required: [result_id, filter_version]
+          description: Remove the document-class scope.
+
+        - name: set_dossier_filter
+          method: POST
+          path: /api/v1/retrieval/results/{{ result_id }}/filter/dossier/set
+          parameters:
+            type: object
+            properties:
+              result_id: { type: string, format: uuid }
+              filter_version: { type: integer }
+              dossier_id: { type: string, format: uuid }
+            required: [result_id, filter_version, dossier_id]
+          description: Scope this result to one specific Dossier.
+
+        - name: set_dossier_class_filter
+          method: POST
+          path: /api/v1/retrieval/results/{{ result_id }}/filter/dossier-class/set
+          parameters:
+            type: object
+            properties:
+              result_id: { type: string, format: uuid }
+              filter_version: { type: integer }
+              dossier_class_id: { type: string, format: uuid }
+            required: [result_id, filter_version, dossier_class_id]
+          description: Scope this result to docs inside dossiers of this class.
+
+        - name: clear_dossier_filters
+          method: POST
+          path: /api/v1/retrieval/results/{{ result_id }}/filter/dossier/clear
+          parameters:
+            type: object
+            properties:
+              result_id: { type: string, format: uuid }
+              filter_version: { type: integer }
+            required: [result_id, filter_version]
+          description: Clear both dossier_id and dossier_class_id.
+
+        - name: set_field_filter
+          method: POST
+          path: /api/v1/retrieval/results/{{ result_id }}/filter/field-filters/{{ field }}/set
+          parameters:
+            type: object
+            properties:
+              result_id: { type: string, format: uuid }
+              field: { type: string }
+              filter_version: { type: integer }
+              op:
+                type: string
+                enum: [eq, in, gte, lte, gt, lt, neq]
+                default: in
+              values:
+                type: array
+              value: {}
+              join:
+                type: string
+                enum: [and, or]
+                default: and
+            required: [result_id, field, filter_version, op]
+          description: Upsert a property field filter. Replaces any existing filter on the same field.
+
+        - name: extend_field_filter_values
+          method: POST
+          path: /api/v1/retrieval/results/{{ result_id }}/filter/field-filters/{{ field }}/extend
+          parameters:
+            type: object
+            properties:
+              result_id: { type: string, format: uuid }
+              field: { type: string }
+              filter_version: { type: integer }
+              values:
+                type: array
+            required: [result_id, field, filter_version, values]
+          description: Append values to an existing field filter (op must be `in` or `neq`). Auto-creates with op=in if absent.
+
+        - name: shrink_field_filter_values
+          method: POST
+          path: /api/v1/retrieval/results/{{ result_id }}/filter/field-filters/{{ field }}/shrink
+          parameters:
+            type: object
+            properties:
+              result_id: { type: string, format: uuid }
+              field: { type: string }
+              filter_version: { type: integer }
+              values:
+                type: array
+            required: [result_id, field, filter_version, values]
+          description: Remove specific values from a field filter. Drops the filter entirely if the values list becomes empty.
+
+        - name: remove_field_filter
+          method: POST
+          path: /api/v1/retrieval/results/{{ result_id }}/filter/field-filters/{{ field }}/remove
+          parameters:
+            type: object
+            properties:
+              result_id: { type: string, format: uuid }
+              field: { type: string }
+              filter_version: { type: integer }
+            required: [result_id, field, filter_version]
+          description: Drop the field filter for this field.
+
+        - name: set_regex_filter
+          method: POST
+          path: /api/v1/retrieval/results/{{ result_id }}/filter/regex-filters/{{ field }}/set
+          parameters:
+            type: object
+            properties:
+              result_id: { type: string, format: uuid }
+              field: { type: string }
+              filter_version: { type: integer }
+              pattern: { type: string }
+            required: [result_id, field, filter_version, pattern]
+          description: Upsert a regex filter on a property field.
+
+        - name: remove_regex_filter
+          method: POST
+          path: /api/v1/retrieval/results/{{ result_id }}/filter/regex-filters/{{ field }}/remove
+          parameters:
+            type: object
+            properties:
+              result_id: { type: string, format: uuid }
+              field: { type: string }
+              filter_version: { type: integer }
+            required: [result_id, field, filter_version]
+          description: Drop the regex filter for this field.
+
+        - name: set_text_search
+          method: POST
+          path: /api/v1/retrieval/results/{{ result_id }}/filter/text-search/set
+          parameters:
+            type: object
+            properties:
+              result_id: { type: string, format: uuid }
+              filter_version: { type: integer }
+              query: { type: string }
+            required: [result_id, filter_version, query]
+          description: Set the full-text-search query on this filter.
+
+        - name: clear_text_search
+          method: POST
+          path: /api/v1/retrieval/results/{{ result_id }}/filter/text-search/clear
+          parameters:
+            type: object
+            properties:
+              result_id: { type: string, format: uuid }
+              filter_version: { type: integer }
+            required: [result_id, filter_version]
+          description: Clear the full-text-search query.
+
+        - name: add_explicit_includes
+          method: POST
+          path: /api/v1/retrieval/results/{{ result_id }}/filter/includes/add
+          parameters:
+            type: object
+            properties:
+              result_id: { type: string, format: uuid }
+              filter_version: { type: integer }
+              document_ids:
+                type: array
+                items: { type: string, format: uuid }
+            required: [result_id, filter_version, document_ids]
+          description: Pin specific documents as forced-includes regardless of other filter clauses.
+
+        - name: remove_explicit_includes
+          method: POST
+          path: /api/v1/retrieval/results/{{ result_id }}/filter/includes/remove
+          parameters:
+            type: object
+            properties:
+              result_id: { type: string, format: uuid }
+              filter_version: { type: integer }
+              document_ids:
+                type: array
+                items: { type: string, format: uuid }
+            required: [result_id, filter_version, document_ids]
+          description: Unpin specific documents from the explicit-includes list.
+
+        - name: clear_explicit_includes
+          method: POST
+          path: /api/v1/retrieval/results/{{ result_id }}/filter/includes/clear
+          parameters:
+            type: object
+            properties:
+              result_id: { type: string, format: uuid }
+              filter_version: { type: integer }
+            required: [result_id, filter_version]
+          description: Clear all explicit includes.
+
+        - name: add_explicit_excludes
+          method: POST
+          path: /api/v1/retrieval/results/{{ result_id }}/filter/excludes/add
+          parameters:
+            type: object
+            properties:
+              result_id: { type: string, format: uuid }
+              filter_version: { type: integer }
+              document_ids:
+                type: array
+                items: { type: string, format: uuid }
+            required: [result_id, filter_version, document_ids]
+          description: Block specific documents from the candidate set.
+
+        - name: remove_explicit_excludes
+          method: POST
+          path: /api/v1/retrieval/results/{{ result_id }}/filter/excludes/remove
+          parameters:
+            type: object
+            properties:
+              result_id: { type: string, format: uuid }
+              filter_version: { type: integer }
+              document_ids:
+                type: array
+                items: { type: string, format: uuid }
+            required: [result_id, filter_version, document_ids]
+          description: Unblock specific documents from the explicit-excludes list.
+
+        - name: clear_explicit_excludes
+          method: POST
+          path: /api/v1/retrieval/results/{{ result_id }}/filter/excludes/clear
+          parameters:
+            type: object
+            properties:
+              result_id: { type: string, format: uuid }
+              filter_version: { type: integer }
+            required: [result_id, filter_version]
+          description: Clear all explicit excludes.
+
+        - name: clear_filter
+          method: POST
+          path: /api/v1/retrieval/results/{{ result_id }}/filter/clear
+          parameters:
+            type: object
+            properties:
+              result_id: { type: string, format: uuid }
+              filter_version: { type: integer }
+            required: [result_id, filter_version]
+          description: Reset the entire filter on this result to empty defaults.
+
+        - name: replace_filter
+          method: POST
+          path: /api/v1/retrieval/results/{{ result_id }}/filter/replace
+          parameters:
+            type: object
+            properties:
+              result_id: { type: string, format: uuid }
+              filter_version: { type: integer }
+              filter: { type: object }
+            required: [result_id, filter_version, filter]
+          description: Total override of the filter. Escape hatch — prefer specific mutations when possible.
 
         - name: append_trace
           method: POST
@@ -592,7 +917,14 @@ spec:
                         f"[grove/post_upload] markitdown produced empty content for {filename}"
                     )
 
-            # 3. Register the document with Grove (idempotent on collection_file_id)
+            # 3. Register the document with Grove (idempotent on collection_file_id).
+            # If the upload metadata carries `staged: true`, the document is
+            # parked: Grove still indexes the text but the auto-pipeline
+            # (classifier + extractors) doesn't fire. The user runs an
+            # IngestionRun later to promote staged docs once their schema is
+            # ready. Used by the discovery upload flow.
+            upload_metadata = input_data.get("metadata") or {}
+            staged = bool(upload_metadata.get("staged", False))
             grove_headers = {
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json",
@@ -603,7 +935,8 @@ spec:
                     "collection_file_id": input_data["file_id"],
                     "filename": filename,
                     "content_md": content_md,
-                    "metadata": input_data.get("metadata") or {},
+                    "metadata": upload_metadata,
+                    "staged": staged,
                 },
                 headers=grove_headers,
                 timeout=60,
@@ -611,7 +944,20 @@ spec:
             register.raise_for_status()
             registered = register.json()
 
-            # 3. Hand off to the ingestion_coordinator agent via Sinas's
+            if staged:
+                # Skip the coordinator — the doc is parked for discovery.
+                return {
+                    "registered": True,
+                    "staged": True,
+                    "document_id": registered["document_id"],
+                    "document_version_id": registered["document_version_id"],
+                    "extracted_chars": len(content_md) if content_md else 0,
+                    "extraction_error": extraction_error,
+                    "agent_chat_id": None,
+                    "agent_reply": "skipped — staged document",
+                }
+
+            # 4. Hand off to the ingestion_coordinator agent via Sinas's
             #    synchronous /agents/{ns}/{name}/invoke endpoint. The
             #    coordinator will fan out to the enrichment agents in
             #    parallel; we wait for it to finish so any failure surfaces
@@ -627,7 +973,7 @@ spec:
                     "document_id": registered["document_id"],
                     "document_version_id": registered["document_version_id"],
                     "version": registered["version"],
-                    "upload_metadata": input_data.get("metadata") or {},
+                    "upload_metadata": upload_metadata,
                 },
             }
             invoke = requests.post(
@@ -640,6 +986,7 @@ spec:
             invoke_result = invoke.json()
             return {
                 "registered": True,
+                "staged": False,
                 "document_id": registered["document_id"],
                 "document_version_id": registered["document_version_id"],
                 "extracted_chars": len(content_md) if content_md else 0,
@@ -994,25 +1341,53 @@ spec:
       systemPrompt: |
         You retrieve documents for a query by iteratively narrowing
         candidates. You do NOT rely on semantic similarity alone — you
-        introspect field value distributions and apply structured filters.
+        introspect property-value distributions and apply structured
+        filters.
+
+        The filter is **persisted on the draft Result**. You do not pass
+        a filter object around; you mutate it via dedicated ops and the
+        server keeps the state. Every mutation auto-writes a trace row —
+        you do NOT need to `append_trace` for filter mutations. Use
+        `append_trace` only for narrative entries (your reasoning,
+        intent, why you chose this branch).
 
         Loop:
-          1. Call `introspect` with the current filter. Read the
+          1. Call `create_draft_result` with the query. You receive
+             `result_id` and `filter_version=0`.
+          2. Call `introspect_by_result(result_id)`. Read the
              distributions: which fields have small, discriminating
              value sets? Which values match the query's intent?
-          2. Update the filter (the agent host maintains it across
-             iterations). Append a trace entry describing the change.
-          3. Repeat until either:
-               - the candidate set matches your playbook's stop
-                 conditions, OR
-               - introspect shows no further filter discriminates the
-                 set meaningfully
-          4. Invoke `process-validation-agent` to check the draft result
-             against the playbook criteria. If it passes, call
-             `add_files_to_result` and return. If not, refine and retry.
-          5. Optionally call `relationship-discovery-agent` to surface
+          3. Mutate the filter using one of:
+               - `set_document_class_filter` to scope to a class
+               - `set_field_filter` / `extend_field_filter_values` /
+                 `shrink_field_filter_values` / `remove_field_filter`
+                 for property filters
+               - `set_text_search` / `clear_text_search` for FTS
+               - `add_explicit_includes` / `add_explicit_excludes` for
+                 pin/block
+               - `clear_filter` / `replace_filter` for resets
+             Pass the `filter_version` you last received. The response
+             gives you a new `filter_version`, the new full `filter`,
+             and the new `candidate_count`. The server traces the change.
+          4. Optionally append a narrative `append_trace` explaining WHY
+             you made the mutation (your reasoning, what you expected).
+          5. Repeat 2–4 until either the candidate set matches your
+             playbook's stop conditions, or introspect shows no further
+             filter discriminates the set meaningfully.
+          6. Call `add_files_to_result` with the surviving candidates
+             (use `get_result_documents` if you've staged inclusions via
+             explicit_includes already).
+          7. Invoke `process-validation-agent` to check the draft
+             against the playbook criteria. If it passes, return. If
+             not, mutate the filter and retry.
+          8. Optionally call `relationship-discovery-agent` to surface
              additional relationships that might inform the user (the
              discovery agent only writes proposals, never facts).
+
+        Probe before commit: if you want to know "what would happen if I
+        added jurisdiction=FR?" without committing the change, pass an
+        `overlay` to `introspect_by_result` — it's read-only and not
+        persisted.
 
         Always load applicable retrieval playbooks via the skill-loading
         tool before starting. The playbook tells you the stop conditions
@@ -1022,15 +1397,43 @@ spec:
       enabledConnectors:
         - connector: grove/api
           operations:
+            # introspect + result lifecycle
             - introspect
+            - introspect_by_result
             - get_document
             - get_property_values
             - read_document_content
             - get_relationships
             - create_draft_result
             - add_files_to_result
+            - remove_files_from_result
+            - clear_result_files
             - append_trace
             - publish_result
+            - get_result
+            - get_result_documents
+            # filter mutations (server-traced)
+            - set_document_class_filter
+            - clear_document_class_filter
+            - set_dossier_filter
+            - set_dossier_class_filter
+            - clear_dossier_filters
+            - set_field_filter
+            - extend_field_filter_values
+            - shrink_field_filter_values
+            - remove_field_filter
+            - set_regex_filter
+            - remove_regex_filter
+            - set_text_search
+            - clear_text_search
+            - add_explicit_includes
+            - remove_explicit_includes
+            - clear_explicit_includes
+            - add_explicit_excludes
+            - remove_explicit_excludes
+            - clear_explicit_excludes
+            - clear_filter
+            - replace_filter
       enabledSkills:
         - skill: grove_retrieval_playbooks/*
           preload: false
@@ -1175,20 +1578,35 @@ spec:
       llmProviderName: ${{ vars.PRIMARY_LLM }}
       systemPrompt: |
         You suggest **new configuration items** based on what a single document
-        contains. Your input contains:
+        contains.
 
-          - run_id (uuid)
-          - kind: one of "document_class", "entity_type",
-                  "relationship_definition", "dossier_class",
-                  "document_class_property"
-          - mode: "greenfield" or "incremental"
-          - document_id (uuid)
-          - parent_class_id (uuid, only for kind=document_class_property)
+        ## This run's context
+
+        - run_id: {{ run_id }}
+        - kind: {{ kind }}
+        - mode: {{ mode }}
+        - document_id: {{ document_id }}
+        {%- if parent_class_id is defined %}
+        - parent_class_id: {{ parent_class_id }}
+        {%- endif %}
+
+        Use these exact values verbatim when calling
+        `submit_discovery_candidate` — `run_id` and `kind` are required and
+        must match the values above.
 
         Your job is to read the document and emit candidate config items via
         `submit_discovery_candidate`. Each candidate is a *raw, per-document*
         finding — it's fine if the same thing appears across many docs; the
         consolidator agent will dedupe later.
+
+        ## Reading the document
+
+        `read_document_content` returns at most ~500 lines per call. The
+        response includes `total_lines`, `line_from`, `line_to`, and
+        `next_line`. If `next_line` is non-null, call again with
+        `line_from=<next_line>` to continue. For a first pass, the front
+        section of the document is usually enough to identify candidates;
+        only continue reading if you genuinely need more context.
 
         ## Mode
 
@@ -1276,9 +1694,13 @@ spec:
       systemPrompt: |
         You consolidate raw discovery candidates into deduplicated proposals.
 
-        Your input contains:
-          - run_id (uuid)
-          - kind: which kind to consolidate
+        ## This run's context
+
+        - run_id: {{ run_id }}
+        - kind: {{ kind }}
+
+        Use these exact values when calling `list_run_candidates` and
+        `submit_consolidated_proposal`.
 
         ## Workflow
 
