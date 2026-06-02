@@ -129,6 +129,27 @@ class RelationshipProposalOut(TimestampedOut, RelationshipProposalIn):
     reviewed_by: uuid.UUID | None = None
 
 
+class UnresolvedRelationshipIn(BaseModel):
+    relationship_definition_id: uuid.UUID
+    source_id: uuid.UUID
+    # Raw reference to the not-yet-ingested target (e.g. an ECLI string) plus
+    # what kind of key it is, so the resolver knows which property to match.
+    target_key: str
+    target_key_kind: str | None = None
+    suggested_state_id: uuid.UUID | None = None
+    proposing_agent: str | None = None
+    reasoning: str | None = None
+    evidence_document_id: uuid.UUID | None = None
+    evidence_span: Span | None = None
+    confidence: float | None = None
+
+
+class UnresolvedRelationshipOut(TimestampedOut, UnresolvedRelationshipIn):
+    status: Literal["unresolved", "resolved", "dismissed"]
+    resolved_relationship_id: uuid.UUID | None = None
+    resolved_at: datetime | None = None
+
+
 # ─────────────────────────────────────────────────────────────
 # Results, traces, answers
 # ─────────────────────────────────────────────────────────────

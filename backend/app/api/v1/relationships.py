@@ -12,8 +12,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import CallerIdentity, get_caller, require_permission
 from app.db import get_session
-from app.models import Relationship, RelationshipProposal
-from app.schemas.runtime import RelationshipOut, RelationshipProposalOut
+from app.models import Relationship, RelationshipProposal, UnresolvedRelationship
+from app.schemas.runtime import (
+    RelationshipOut,
+    RelationshipProposalOut,
+    UnresolvedRelationshipOut,
+)
 
 router = APIRouter(prefix="/relationships", tags=["relationships"])
 
@@ -48,6 +52,24 @@ async def list_proposals(
         )
     ).scalars().all()
     return rows
+
+
+@router.get("/unresolved", response_model=list[UnresolvedRelationshipOut])
+async def list_unresolved(
+    status_filter: str = "unresolved",
+    source_id: uuid.UUID | None = None,
+    target_key: str | None = None,
+    session: AsyncSession = Depends(get_session),
+):
+    stmt = select(UnresolvedRelationship).where(
+        UnresolvedRelationship.status == status_filter
+    )
+    if source_id is not None:
+        stmt = stmt.where(UnresolvedRelationship.source_id == source_id)
+    if target_key is not None:
+        stmt = stmt.where(UnresolvedRelationship.target_key == target_key)
+    stmt = stmt.order_by(UnresolvedRelationship.created_at.desc())
+    return (await session.execute(stmt)).scalars().all()
 
 
 class ProposalDecision(BaseModel):

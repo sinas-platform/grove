@@ -1,6 +1,6 @@
 import { SinasClient } from '@sinas/sdk';
 
-const API_BASE = import.meta.env.VITE_GROVE_API ?? '/api/v1';
+export const API_BASE = import.meta.env.VITE_GROVE_API ?? '/api/v1';
 
 const ACCESS_KEY = 'grove_access_token';
 const REFRESH_KEY = 'grove_refresh_token';

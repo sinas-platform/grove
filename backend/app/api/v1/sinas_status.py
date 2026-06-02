@@ -4,7 +4,9 @@ and at what version? Used by the admin UI to surface drift / missing install.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends
+from pathlib import Path
+
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 from pydantic import BaseModel
 
 from app.auth import CallerIdentity, get_caller
@@ -15,6 +17,23 @@ router = APIRouter(prefix="/sinas-status", tags=["sinas-status"])
 
 EXPECTED_PACKAGE_NAME = "sinas-grove"
 EXPECTED_PACKAGE_VERSION = "0.1.8"
+
+
+def _bundled_package_path() -> Path | None:
+    """Locate the bundled sinas-grove.yaml.
+
+    In the container the Dockerfile copies `package/` next to `backend/` at
+    /app/package/. In local dev the repo layout puts it two levels above this
+    file. Try both.
+    """
+    candidates = [
+        Path("/app/package/sinas-grove.yaml"),
+        Path(__file__).resolve().parents[4] / "package" / "sinas-grove.yaml",
+    ]
+    for p in candidates:
+        if p.is_file():
+            return p
+    return None
 
 
 class SinasStatusOut(BaseModel):
@@ -66,4 +85,20 @@ async def get_sinas_status(
         installed_version=installed_version,
         drift=drift,
         note=None if not drift else "installed version differs from this Grove build",
+    )
+
+
+@router.get("/package.yaml")
+async def download_bundled_package() -> Response:
+    """Return the bundled sinas-grove.yaml that ships with this Grove build."""
+    path = _bundled_package_path()
+    if path is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            "bundled sinas-grove.yaml not found in this build",
+        )
+    return Response(
+        content=path.read_text(encoding="utf-8"),
+        media_type="application/x-yaml",
+        headers={"Content-Disposition": 'attachment; filename="sinas-grove.yaml"'},
     )

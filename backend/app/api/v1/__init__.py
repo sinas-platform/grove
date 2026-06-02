@@ -10,6 +10,7 @@ from app.api.v1 import (
     info,
     ingestion,
     me,
+    packages,
     playbooks,
     relationships,
     result_filter,
@@ -42,6 +43,7 @@ api_router.include_router(synthesis.router)
 api_router.include_router(answers.router)
 api_router.include_router(relationships.router)
 api_router.include_router(playbooks.router)
+api_router.include_router(packages.router)
 api_router.include_router(sinas_status.router)
 api_router.include_router(uploads.router)
 api_router.include_router(runs.router)

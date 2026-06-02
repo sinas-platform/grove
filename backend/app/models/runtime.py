@@ -178,6 +178,57 @@ class RelationshipProposal(Base, TimestampMixin):
     reviewed_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
 
 
+class UnresolvedRelationship(Base, TimestampMixin):
+    """A relationship whose source node is known but whose target isn't in the
+    graph yet — e.g. an article that cites an ECLI we haven't ingested.
+
+    Held as a candidate keyed by `target_key` (the raw external reference). A
+    resolver promotes it to a real `Relationship` once a node carrying that key
+    is ingested, so we never have to re-scan every existing document on each new
+    ingest — resolution is a single keyed lookup at the moment the target lands.
+    """
+
+    __tablename__ = "unresolved_relationship"
+    __table_args__ = (
+        Index(
+            "ix_unresolved_rel_open",
+            "target_key",
+            postgresql_where="status = 'unresolved'",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    relationship_definition_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("relationship_definition.id", ondelete="CASCADE"),
+        index=True,
+    )
+    # The known end of the edge — type comes from the definition's source ref.
+    source_id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), nullable=False, index=True)
+    # The unresolved end: a raw external key plus what kind it is, so the
+    # resolver knows which document property to match against (e.g. "ecli").
+    target_key: Mapped[str] = mapped_column(String(500), nullable=False)
+    target_key_kind: Mapped[str | None] = mapped_column(String(64))
+    suggested_state_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("relationship_state.id", ondelete="SET NULL")
+    )
+    proposing_agent: Mapped[str | None] = mapped_column(String(200))
+    reasoning: Mapped[str | None] = mapped_column(Text)
+    evidence_document_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("document.id", ondelete="SET NULL")
+    )
+    evidence_span: Mapped[dict | None] = mapped_column(JSONB)
+    confidence: Mapped[float | None] = mapped_column(Float)
+    # unresolved → resolved (target ingested, promoted) | dismissed (won't resolve)
+    status: Mapped[str] = mapped_column(
+        String(20), default="unresolved", nullable=False, index=True
+    )
+    resolved_relationship_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("relationship.id", ondelete="SET NULL")
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 # ─────────────────────────────────────────────────────────────
 # Results, traces, answers, claim evidence
 # ─────────────────────────────────────────────────────────────

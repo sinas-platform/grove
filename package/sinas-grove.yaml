@@ -9,7 +9,7 @@ metadata:
 
 package:
   name: sinas-grove
-  version: "0.1.9"
+  version: "0.1.10"
   description: >
     Sinas Grove — stateful, multi-agent document indexing and retrieval. The
     runtime is generic; domain knowledge (document classes, properties,
@@ -305,6 +305,31 @@ spec:
               evidence_span: { type: object }
               confidence: { type: number }
             required: [relationship_definition_id, source_id, target_id]
+
+        - name: record_unresolved_relationship
+          method: POST
+          path: /api/v1/ingest/unresolved-relationships
+          parameters:
+            type: object
+            properties:
+              relationship_definition_id: { type: string, format: uuid }
+              source_id: { type: string, format: uuid }
+              target_key: { type: string }
+              target_key_kind: { type: string }
+              suggested_state_id: { type: string, format: uuid }
+              proposing_agent: { type: string }
+              reasoning: { type: string }
+              evidence_document_id: { type: string, format: uuid }
+              evidence_span: { type: object }
+              confidence: { type: number }
+            required: [relationship_definition_id, source_id, target_key]
+          description: |
+            Record a relationship whose source node is known but whose target
+            isn't in the graph yet — e.g. the document cites an ECLI we haven't
+            ingested. Pass the raw reference as `target_key` (and `target_key_kind`,
+            e.g. "ecli"). The edge is held until a resolver promotes it to a real
+            relationship when the target is later ingested. Prefer this over
+            dropping a cite you can't resolve.
 
         - name: assign_dossier
           method: POST
@@ -736,6 +761,21 @@ spec:
               relationship_definition_id: { type: string, format: uuid }
               source_id: { type: string, format: uuid }
               target_id: { type: string, format: uuid }
+
+        - name: get_unresolved_relationships
+          method: GET
+          path: /api/v1/relationships/unresolved
+          parameters:
+            type: object
+            properties:
+              status_filter: { type: string }
+              source_id: { type: string, format: uuid }
+              target_key: { type: string }
+          description: >
+            List parked relationships whose target node isn't in the graph yet
+            (e.g. cited ECLIs not yet ingested). Filter by status_filter
+            (default "unresolved"), source_id, or target_key. The future
+            resolver agent reads these to promote them once targets are ingested.
 
         # ── discovery (config auto-suggestion) ──
         - name: list_run_candidates
@@ -1240,9 +1280,17 @@ spec:
              or target (per source_ref_type / target_ref_type):
               a. Read the document via `read_document_content`.
               b. For each relationship instance you find:
-                  - if confidence ≥ 0.8: call `record_relationship`
-                  - if confidence < 0.8: call `propose_relationship`
-                    (queues for human review)
+                  - if BOTH ends resolve to known nodes in the graph:
+                      • confidence ≥ 0.8: call `record_relationship`
+                      • confidence < 0.8: call `propose_relationship`
+                        (queues for human review)
+                  - if the target is named but you cannot resolve it to a
+                    node in the graph (e.g. the document cites an ECLI we
+                    haven't ingested): call `record_unresolved_relationship`
+                    with the raw reference as `target_key` and its kind as
+                    `target_key_kind` (e.g. "ecli"). A resolver promotes it
+                    to a real relationship when the target is later ingested.
+                    Do NOT drop the cite — record it as unresolved.
               c. Always include `evidence_document_id` and
                  `evidence_span`.
 
@@ -1257,6 +1305,7 @@ spec:
             - read_document_content
             - record_relationship
             - propose_relationship
+            - record_unresolved_relationship
 
     - namespace: grove
       name: dossier-assigner-agent

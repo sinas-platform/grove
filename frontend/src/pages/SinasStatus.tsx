@@ -1,5 +1,5 @@
 import { useQuery } from '@tanstack/react-query';
-import { api } from '@/lib/api';
+import { api, API_BASE, client } from '@/lib/api';
 import { PageHeader } from '@/components/PageHeader';
 
 interface SinasStatus {
@@ -10,6 +10,22 @@ interface SinasStatus {
   installed_version: string | null;
   drift: boolean;
   note: string | null;
+}
+
+async function downloadBundledPackage() {
+  const res = await client.fetch(`${API_BASE}/sinas-status/package.yaml`);
+  if (!res.ok) {
+    alert(`Download failed: ${res.status} ${res.statusText}`);
+    return;
+  }
+  const text = await res.text();
+  const blob = new Blob([text], { type: 'application/x-yaml' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'sinas-grove.yaml';
+  a.click();
+  URL.revokeObjectURL(url);
 }
 
 export default function SinasStatusPage() {
@@ -24,12 +40,20 @@ export default function SinasStatusPage() {
         title="Sinas integration"
         description="Status of the sinas-grove package on the Sinas instance Grove is talking to."
         actions={
-          <button
-            onClick={() => refetch()}
-            className="px-3 py-1.5 rounded border border-stone-300 text-sm hover:bg-stone-100"
-          >
-            Recheck
-          </button>
+          <div className="flex gap-2">
+            <button
+              onClick={downloadBundledPackage}
+              className="px-3 py-1.5 rounded border border-stone-300 text-sm hover:bg-stone-100"
+            >
+              Download package YAML
+            </button>
+            <button
+              onClick={() => refetch()}
+              className="px-3 py-1.5 rounded border border-stone-300 text-sm hover:bg-stone-100"
+            >
+              Recheck
+            </button>
+          </div>
         }
       />
       {isLoading && <div className="text-stone-500">Checking…</div>}

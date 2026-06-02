@@ -35,6 +35,7 @@ from app.models.runtime import (
     Result,
     ResultDocument,
     ResultTrace,
+    UnresolvedRelationship,
 )
 
 __all__ = [
@@ -56,6 +57,7 @@ __all__ = [
     "EntityMention",
     "Relationship",
     "RelationshipProposal",
+    "UnresolvedRelationship",
     "Result",
     "ResultDocument",
     "ResultTrace",

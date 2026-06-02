@@ -59,6 +59,9 @@ COPY --from=deps /usr/local/bin /usr/local/bin
 COPY backend/ ./backend/
 COPY alembic.ini ./alembic.ini
 
+# Bundled SinasPackage YAML (downloadable from the admin UI / API)
+COPY package/ ./package/
+
 # Frontend build into the static dir FastAPI serves
 COPY --from=frontend /build/dist ./backend/app/static
 

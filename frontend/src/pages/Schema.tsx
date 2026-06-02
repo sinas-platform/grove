@@ -5,8 +5,15 @@ import EntityTypesPage from './EntityTypes';
 import RelationshipsPage from './Relationships';
 import DossierClassesPage from './DossierClasses';
 import PlaybooksPage from './Playbooks';
+import PackagesPage from './Packages';
 
-type Tab = 'document_classes' | 'entity_types' | 'relationships' | 'dossier_classes' | 'playbooks';
+type Tab =
+  | 'document_classes'
+  | 'entity_types'
+  | 'relationships'
+  | 'dossier_classes'
+  | 'playbooks'
+  | 'packages';
 
 const TABS: { value: Tab; label: string; sub: string }[] = [
   { value: 'document_classes', label: 'Document classes', sub: 'Kinds of documents Grove indexes' },
@@ -14,6 +21,7 @@ const TABS: { value: Tab; label: string; sub: string }[] = [
   { value: 'relationships', label: 'Relationships', sub: 'Edges between docs / entities / dossiers' },
   { value: 'dossier_classes', label: 'Dossier classes', sub: 'Optional document containers' },
   { value: 'playbooks', label: 'Playbooks', sub: 'Markdown skills agents load on demand' },
+  { value: 'packages', label: 'Packages', sub: 'Import / export the full domain config as a YAML file' },
 ];
 
 export default function SchemaPage() {
@@ -49,6 +57,7 @@ export default function SchemaPage() {
       {tab === 'relationships' && <RelationshipsPage embedded />}
       {tab === 'dossier_classes' && <DossierClassesPage embedded />}
       {tab === 'playbooks' && <PlaybooksPage embedded />}
+      {tab === 'packages' && <PackagesPage embedded />}
     </div>
   );
 }

@@ -17,6 +17,7 @@ import EntityTypesPage from './pages/EntityTypes';
 import RelationshipsPage from './pages/Relationships';
 import DossierClassesPage from './pages/DossierClasses';
 import PlaybooksPage from './pages/Playbooks';
+import PackagesPage from './pages/Packages';
 import ProposalsPage from './pages/Proposals';
 import IngestionRunsPage from './pages/IngestionRuns';
 import DiscoveryPage from './pages/Discovery';
@@ -55,6 +56,7 @@ export default function App() {
         <Route path="config/relationships" element={<RelationshipsPage />} />
         <Route path="config/dossier-classes" element={<DossierClassesPage />} />
         <Route path="config/playbooks" element={<PlaybooksPage />} />
+        <Route path="config/packages" element={<PackagesPage />} />
         <Route path="review/proposals" element={<ProposalsPage />} />
         <Route path="ingestion/runs" element={<IngestionRunsPage />} />
         <Route path="discovery" element={<DiscoveryPage />} />

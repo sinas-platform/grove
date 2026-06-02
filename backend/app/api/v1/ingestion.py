@@ -25,6 +25,7 @@ from app.models import (
     PropertyValue,
     Relationship,
     RelationshipProposal,
+    UnresolvedRelationship,
 )
 from app.schemas.runtime import (
     PropertyValueIn,
@@ -33,6 +34,8 @@ from app.schemas.runtime import (
     RelationshipOut,
     RelationshipProposalIn,
     RelationshipProposalOut,
+    UnresolvedRelationshipIn,
+    UnresolvedRelationshipOut,
 )
 
 router = APIRouter(prefix="/ingest", tags=["ingestion"])
@@ -288,6 +291,28 @@ async def propose_relationship(
     payload: RelationshipProposalIn, session: AsyncSession = Depends(get_session)
 ):
     row = RelationshipProposal(**payload.model_dump(), status="pending")
+    session.add(row)
+    await session.commit()
+    await session.refresh(row)
+    return row
+
+
+@router.post(
+    "/unresolved-relationships",
+    response_model=UnresolvedRelationshipOut,
+    status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_permission("grove.ingestion.write:own"))],
+)
+async def record_unresolved_relationship(
+    payload: UnresolvedRelationshipIn, session: AsyncSession = Depends(get_session)
+):
+    """Park a relationship whose target node isn't in the graph yet (e.g. a
+    cited ECLI we haven't ingested), keyed by `target_key`. A resolver promotes
+    it to a real Relationship once the target lands — see UnresolvedRelationship.
+    """
+    data = payload.model_dump()
+    span = data.pop("evidence_span", None)
+    row = UnresolvedRelationship(**data, evidence_span=span, status="unresolved")
     session.add(row)
     await session.commit()
     await session.refresh(row)

@@ -24,6 +24,7 @@ class DocumentClass(Base, TimestampMixin):
     description: Mapped[str | None] = mapped_column(Text)
     summarization_guidance: Mapped[str | None] = mapped_column(Text)
     classification_hints: Mapped[str | None] = mapped_column(Text)
+    managed_by: Mapped[str | None] = mapped_column(String(128), index=True)
 
     properties: Mapped[list["DocumentClassProperty"]] = relationship(
         back_populates="document_class", cascade="all, delete-orphan"
@@ -63,6 +64,7 @@ class EntityType(Base, TimestampMixin):
     name: Mapped[str] = mapped_column(String(200), nullable=False, unique=True)
     description: Mapped[str | None] = mapped_column(Text)
     guidance: Mapped[str | None] = mapped_column(Text)
+    managed_by: Mapped[str | None] = mapped_column(String(128), index=True)
 
 
 class DocumentClassEntityType(Base):
@@ -94,6 +96,7 @@ class RelationshipDefinition(Base, TimestampMixin):
     cardinality: Mapped[str] = mapped_column(String(10), default="many", nullable=False)
     extraction_guidance: Mapped[str | None] = mapped_column(Text)
     discovery_guidance: Mapped[str | None] = mapped_column(Text)
+    managed_by: Mapped[str | None] = mapped_column(String(128), index=True)
 
     states: Mapped[list["RelationshipState"]] = relationship(
         back_populates="definition", cascade="all, delete-orphan"
@@ -132,6 +135,7 @@ class DossierClass(Base, TimestampMixin):
     guidance: Mapped[str | None] = mapped_column(Text)
     summarization_guidance: Mapped[str | None] = mapped_column(Text)
     classification_hints: Mapped[str | None] = mapped_column(Text)
+    managed_by: Mapped[str | None] = mapped_column(String(128), index=True)
 
     properties: Mapped[list["DossierClassProperty"]] = relationship(
         back_populates="dossier_class", cascade="all, delete-orphan"
@@ -205,3 +209,4 @@ class PlaybookScope(Base, TimestampMixin):
     dossier_class_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("dossier_class.id", ondelete="CASCADE")
     )
+    managed_by: Mapped[str | None] = mapped_column(String(128), index=True)
