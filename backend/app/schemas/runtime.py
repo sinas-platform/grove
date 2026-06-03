@@ -150,6 +150,41 @@ class UnresolvedRelationshipOut(TimestampedOut, UnresolvedRelationshipIn):
     resolved_at: datetime | None = None
 
 
+class EntityProposalIn(BaseModel):
+    entity_type_id: uuid.UUID
+    canonical_form: str
+    extra_metadata: dict | None = None
+    proposing_agent: str | None = None
+    reasoning: str | None = None
+    evidence_document_id: uuid.UUID | None = None
+    evidence_span: Span | None = None
+    confidence: float | None = None
+
+
+class EntityProposalOut(TimestampedOut, EntityProposalIn):
+    status: Literal["pending", "approved", "rejected"]
+    reviewed_at: datetime | None = None
+    reviewed_by: uuid.UUID | None = None
+    promoted_entity_id: uuid.UUID | None = None
+
+
+class UnresolvedEntityMentionIn(BaseModel):
+    entity_type_id: uuid.UUID
+    mention_text: str
+    document_id: uuid.UUID
+    document_version_id: uuid.UUID | None = None
+    span: dict
+    confidence: float | None = None
+    proposing_agent: str | None = None
+    reasoning: str | None = None
+
+
+class UnresolvedEntityMentionOut(TimestampedOut, UnresolvedEntityMentionIn):
+    status: Literal["unresolved", "resolved", "dismissed"]
+    resolved_entity_id: uuid.UUID | None = None
+    resolved_at: datetime | None = None
+
+
 # ─────────────────────────────────────────────────────────────
 # Results, traces, answers
 # ─────────────────────────────────────────────────────────────

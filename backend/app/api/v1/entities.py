@@ -1,0 +1,264 @@
+"""Entities — read views, proposal review, unresolved-mention resolution.
+
+Mirrors `relationships.py`. Created when EntityType.creation_mode is `review`
+or `closed`, the rows here hold mentions the extractor couldn't auto-promote.
+"""
+
+from __future__ import annotations
+
+import uuid
+from datetime import datetime, timezone
+
+from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import BaseModel
+from sqlalchemy import select, update
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.auth import CallerIdentity, get_caller, require_permission
+from app.db import get_session
+from app.models import (
+    Entity,
+    EntityMention,
+    EntityProposal,
+    UnresolvedEntityMention,
+)
+from app.schemas.runtime import (
+    EntityProposalOut,
+    UnresolvedEntityMentionOut,
+)
+
+router = APIRouter(prefix="/entities", tags=["entities"])
+
+
+class EntitySummary(BaseModel):
+    id: uuid.UUID
+    entity_type_id: uuid.UUID
+    canonical_form: str
+
+
+@router.get("", response_model=list[EntitySummary])
+async def list_entities(
+    entity_type_id: uuid.UUID | None = None,
+    q: str | None = None,
+    limit: int = 100,
+    session: AsyncSession = Depends(get_session),
+):
+    stmt = select(Entity)
+    if entity_type_id is not None:
+        stmt = stmt.where(Entity.entity_type_id == entity_type_id)
+    if q:
+        stmt = stmt.where(Entity.canonical_form.ilike(f"%{q}%"))
+    stmt = stmt.order_by(Entity.canonical_form).limit(limit)
+    return (await session.execute(stmt)).scalars().all()
+
+
+@router.get("/proposals", response_model=list[EntityProposalOut])
+async def list_entity_proposals(
+    status_filter: str = "pending",
+    session: AsyncSession = Depends(get_session),
+):
+    rows = (
+        await session.execute(
+            select(EntityProposal)
+            .where(EntityProposal.status == status_filter)
+            .order_by(EntityProposal.created_at.desc())
+        )
+    ).scalars().all()
+    return rows
+
+
+class EntityProposalDecision(BaseModel):
+    approve: bool
+
+
+@router.post(
+    "/proposals/{proposal_id}/decision",
+    dependencies=[Depends(require_permission("grove.admin:all"))],
+)
+async def decide_entity_proposal(
+    proposal_id: uuid.UUID,
+    payload: EntityProposalDecision,
+    session: AsyncSession = Depends(get_session),
+    caller: CallerIdentity = Depends(get_caller),
+):
+    proposal = await session.get(EntityProposal, proposal_id)
+    if proposal is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "proposal not found")
+    if proposal.status != "pending":
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, f"proposal already {proposal.status}"
+        )
+    proposal.status = "approved" if payload.approve else "rejected"
+    proposal.reviewed_at = datetime.now(timezone.utc)
+    proposal.reviewed_by = caller.user_id
+
+    promoted_id: uuid.UUID | None = None
+    if payload.approve:
+        entity = Entity(
+            entity_type_id=proposal.entity_type_id,
+            canonical_form=proposal.canonical_form,
+            extra_metadata=proposal.extra_metadata,
+        )
+        session.add(entity)
+        await session.flush()
+        proposal.promoted_entity_id = entity.id
+        promoted_id = entity.id
+
+    await session.commit()
+    return {"status": proposal.status, "promoted_entity_id": promoted_id}
+
+
+@router.get("/unresolved", response_model=list[UnresolvedEntityMentionOut])
+async def list_unresolved_entity_mentions(
+    status_filter: str = "unresolved",
+    entity_type_id: uuid.UUID | None = None,
+    document_id: uuid.UUID | None = None,
+    session: AsyncSession = Depends(get_session),
+):
+    stmt = select(UnresolvedEntityMention).where(
+        UnresolvedEntityMention.status == status_filter
+    )
+    if entity_type_id is not None:
+        stmt = stmt.where(UnresolvedEntityMention.entity_type_id == entity_type_id)
+    if document_id is not None:
+        stmt = stmt.where(UnresolvedEntityMention.document_id == document_id)
+    stmt = stmt.order_by(UnresolvedEntityMention.created_at.desc())
+    return (await session.execute(stmt)).scalars().all()
+
+
+class MatchToExistingBody(BaseModel):
+    entity_id: uuid.UUID
+    add_alias: bool = True
+
+
+@router.post(
+    "/unresolved/{mention_id}/match",
+    dependencies=[Depends(require_permission("grove.admin:all"))],
+)
+async def match_unresolved_to_entity(
+    mention_id: uuid.UUID,
+    payload: MatchToExistingBody,
+    session: AsyncSession = Depends(get_session),
+    caller: CallerIdentity = Depends(get_caller),
+):
+    row = await session.get(UnresolvedEntityMention, mention_id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "unresolved mention not found")
+    if row.status != "unresolved":
+        raise HTTPException(status.HTTP_409_CONFLICT, f"already {row.status}")
+    entity = await session.get(Entity, payload.entity_id)
+    if entity is None or entity.entity_type_id != row.entity_type_id:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "target entity not found or has a different entity type",
+        )
+
+    # Materialize a real mention and (optionally) record the surface form as an alias.
+    session.add(
+        EntityMention(
+            document_id=row.document_id,
+            document_version_id=row.document_version_id,
+            entity_id=entity.id,
+            span=row.span,
+            confidence=row.confidence,
+        )
+    )
+    if payload.add_alias and row.mention_text != entity.canonical_form:
+        from app.models import EntityAlias
+
+        existing = (
+            await session.execute(
+                select(EntityAlias).where(
+                    EntityAlias.entity_id == entity.id,
+                    EntityAlias.alias == row.mention_text,
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is None:
+            session.add(EntityAlias(entity_id=entity.id, alias=row.mention_text))
+
+    row.status = "resolved"
+    row.resolved_at = datetime.now(timezone.utc)
+    row.resolved_by = caller.user_id
+    row.resolved_entity_id = entity.id
+
+    # Also resolve any other open mentions of the same surface form in this type.
+    await session.execute(
+        update(UnresolvedEntityMention)
+        .where(
+            UnresolvedEntityMention.entity_type_id == row.entity_type_id,
+            UnresolvedEntityMention.mention_text == row.mention_text,
+            UnresolvedEntityMention.status == "unresolved",
+            UnresolvedEntityMention.id != row.id,
+        )
+        .values(
+            status="resolved",
+            resolved_at=datetime.now(timezone.utc),
+            resolved_by=caller.user_id,
+            resolved_entity_id=entity.id,
+        )
+    )
+
+    await session.commit()
+    return {"status": "resolved", "entity_id": entity.id}
+
+
+@router.post(
+    "/unresolved/{mention_id}/promote",
+    dependencies=[Depends(require_permission("grove.admin:all"))],
+)
+async def promote_unresolved_to_entity(
+    mention_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    caller: CallerIdentity = Depends(get_caller),
+):
+    """Create a new Entity from this mention. Only safe to call if the operator
+    has accepted that the EntityType's closed set should grow."""
+    row = await session.get(UnresolvedEntityMention, mention_id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "unresolved mention not found")
+    if row.status != "unresolved":
+        raise HTTPException(status.HTTP_409_CONFLICT, f"already {row.status}")
+
+    entity = Entity(
+        entity_type_id=row.entity_type_id,
+        canonical_form=row.mention_text,
+    )
+    session.add(entity)
+    await session.flush()
+    session.add(
+        EntityMention(
+            document_id=row.document_id,
+            document_version_id=row.document_version_id,
+            entity_id=entity.id,
+            span=row.span,
+            confidence=row.confidence,
+        )
+    )
+    row.status = "resolved"
+    row.resolved_at = datetime.now(timezone.utc)
+    row.resolved_by = caller.user_id
+    row.resolved_entity_id = entity.id
+    await session.commit()
+    return {"status": "resolved", "entity_id": entity.id}
+
+
+@router.post(
+    "/unresolved/{mention_id}/dismiss",
+    dependencies=[Depends(require_permission("grove.admin:all"))],
+)
+async def dismiss_unresolved(
+    mention_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    caller: CallerIdentity = Depends(get_caller),
+):
+    row = await session.get(UnresolvedEntityMention, mention_id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "unresolved mention not found")
+    if row.status != "unresolved":
+        raise HTTPException(status.HTTP_409_CONFLICT, f"already {row.status}")
+    row.status = "dismissed"
+    row.resolved_at = datetime.now(timezone.utc)
+    row.resolved_by = caller.user_id
+    await session.commit()
+    return {"status": "dismissed"}

@@ -13,6 +13,7 @@ import {
 } from '@/components/Form';
 
 type RefType = 'document_class' | 'entity_type' | 'dossier_class';
+type CreationMode = 'open' | 'review' | 'closed';
 
 interface RelationshipDefinition {
   id: string;
@@ -25,7 +26,24 @@ interface RelationshipDefinition {
   cardinality: 'one' | 'many';
   extraction_guidance: string | null;
   discovery_guidance: string | null;
+  creation_mode: CreationMode;
 }
+
+const MODE_LABEL: Record<CreationMode, string> = {
+  open: 'Allow',
+  review: 'Review',
+  closed: 'Lock',
+};
+const MODE_HINT: Record<CreationMode, string> = {
+  open: 'Agents may add new edges of this definition directly.',
+  review: 'New edges are held as proposals until a human approves them.',
+  closed: 'Runtime extraction is blocked. Only the curated edges from the YAML / admin UI exist.',
+};
+const MODE_BADGE: Record<CreationMode, string> = {
+  open: 'bg-stone-100 text-stone-700',
+  review: 'bg-amber-100 text-amber-800',
+  closed: 'bg-red-100 text-red-800',
+};
 
 interface RelationshipState {
   id: string;
@@ -127,7 +145,14 @@ export default function RelationshipsPage({ embedded = false }: { embedded?: boo
                   : 'border-stone-200 bg-white hover:border-stone-300'
               }`}
             >
-              <div className="font-medium text-sm">{rd.name}</div>
+              <div className="flex items-center justify-between gap-2">
+                <div className="font-medium text-sm">{rd.name}</div>
+                <span
+                  className={`text-[10px] px-1.5 py-0.5 rounded uppercase tracking-wider ${MODE_BADGE[rd.creation_mode]}`}
+                >
+                  {MODE_LABEL[rd.creation_mode]}
+                </span>
+              </div>
               <div className="text-xs text-stone-500 mt-1">
                 {labelFor(rd.source_ref_type, rd.source_ref_id)}
                 {' → '}
@@ -206,6 +231,7 @@ function Editor({
     cardinality: initial?.cardinality ?? ('many' as 'one' | 'many'),
     extraction_guidance: initial?.extraction_guidance ?? '',
     discovery_guidance: initial?.discovery_guidance ?? '',
+    creation_mode: (initial?.creation_mode ?? 'open') as CreationMode,
   });
   const [error, setError] = useState<string | null>(null);
 
@@ -341,6 +367,26 @@ function Editor({
           rows={3}
           className={textareaClasses}
         />
+      </Field>
+      <Field label="Creation mode" hint="who may add new edges of this definition">
+        <div className="space-y-1">
+          {(['open', 'review', 'closed'] as CreationMode[]).map((m) => (
+            <label key={m} className="flex items-start gap-2 text-sm">
+              <input
+                type="radio"
+                name="rel_creation_mode"
+                value={m}
+                checked={draft.creation_mode === m}
+                onChange={() => setDraft({ ...draft, creation_mode: m })}
+                className="mt-0.5"
+              />
+              <span>
+                <span className="font-medium">{MODE_LABEL[m]}</span>{' '}
+                <span className="text-stone-500 text-xs">— {MODE_HINT[m]}</span>
+              </span>
+            </label>
+          ))}
+        </div>
       </Field>
       <ErrorBanner message={error} />
       <div>

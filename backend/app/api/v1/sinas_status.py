@@ -16,7 +16,7 @@ from app.services.sinas import Management, get_management
 router = APIRouter(prefix="/sinas-status", tags=["sinas-status"])
 
 EXPECTED_PACKAGE_NAME = "sinas-grove"
-EXPECTED_PACKAGE_VERSION = "0.1.8"
+EXPECTED_PACKAGE_VERSION = "0.1.11"
 
 
 def _bundled_package_path() -> Path | None:

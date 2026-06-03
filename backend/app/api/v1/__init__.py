@@ -5,6 +5,7 @@ from app.api.v1 import (
     config,
     discovery,
     documents,
+    entities,
     dossiers,
     health,
     info,
@@ -42,6 +43,7 @@ api_router.include_router(results.router)
 api_router.include_router(synthesis.router)
 api_router.include_router(answers.router)
 api_router.include_router(relationships.router)
+api_router.include_router(entities.router)
 api_router.include_router(playbooks.router)
 api_router.include_router(packages.router)
 api_router.include_router(sinas_status.router)

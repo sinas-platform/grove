@@ -11,12 +11,31 @@ import {
   textareaClasses,
 } from '@/components/Form';
 
+type CreationMode = 'open' | 'review' | 'closed';
+
 interface EntityType {
   id: string;
   name: string;
   description: string | null;
   guidance: string | null;
+  creation_mode: CreationMode;
 }
+
+const MODE_LABEL: Record<CreationMode, string> = {
+  open: 'Allow',
+  review: 'Review',
+  closed: 'Lock',
+};
+const MODE_HINT: Record<CreationMode, string> = {
+  open: 'Agent may auto-create new entities of this type.',
+  review: 'New entities are held as proposals until a human approves them.',
+  closed: 'Only entities already in the table can match. Unknown mentions are parked for review.',
+};
+const MODE_BADGE: Record<CreationMode, string> = {
+  open: 'bg-stone-100 text-stone-700',
+  review: 'bg-amber-100 text-amber-800',
+  closed: 'bg-red-100 text-red-800',
+};
 
 export default function EntityTypesPage({ embedded = false }: { embedded?: boolean } = {}) {
   const qc = useQueryClient();
@@ -75,7 +94,14 @@ export default function EntityTypesPage({ embedded = false }: { embedded?: boole
                   : 'border-stone-200 bg-white hover:border-stone-300'
               }`}
             >
-              <div className="font-medium text-sm">{et.name}</div>
+              <div className="flex items-center justify-between gap-2">
+                <div className="font-medium text-sm">{et.name}</div>
+                <span
+                  className={`text-[10px] px-1.5 py-0.5 rounded uppercase tracking-wider ${MODE_BADGE[et.creation_mode]}`}
+                >
+                  {MODE_LABEL[et.creation_mode]}
+                </span>
+              </div>
               {et.description && (
                 <div className="text-xs text-stone-500 mt-1 line-clamp-2">{et.description}</div>
               )}
@@ -134,6 +160,7 @@ function Editor({
     name: initial?.name ?? '',
     description: initial?.description ?? '',
     guidance: initial?.guidance ?? '',
+    creation_mode: (initial?.creation_mode ?? 'open') as CreationMode,
   });
   const [error, setError] = useState<string | null>(null);
 
@@ -195,6 +222,26 @@ function Editor({
           rows={4}
           className={textareaClasses}
         />
+      </Field>
+      <Field label="Creation mode" hint="what happens when the extractor mentions a new value">
+        <div className="space-y-1">
+          {(['open', 'review', 'closed'] as CreationMode[]).map((m) => (
+            <label key={m} className="flex items-start gap-2 text-sm">
+              <input
+                type="radio"
+                name="creation_mode"
+                value={m}
+                checked={draft.creation_mode === m}
+                onChange={() => setDraft({ ...draft, creation_mode: m })}
+                className="mt-0.5"
+              />
+              <span>
+                <span className="font-medium">{MODE_LABEL[m]}</span>{' '}
+                <span className="text-stone-500 text-xs">— {MODE_HINT[m]}</span>
+              </span>
+            </label>
+          ))}
+        </div>
       </Field>
       <ErrorBanner message={error} />
       <div>

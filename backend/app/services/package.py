@@ -256,6 +256,7 @@ async def _apply_entity_types(ctx: _ApplyCtx) -> None:
             {
                 "description": et.description,
                 "guidance": et.guidance,
+                "creation_mode": et.creation_mode,
                 "managed_by": ctx.tag,
             },
         )
@@ -530,6 +531,7 @@ async def _apply_relationship_definitions(ctx: _ApplyCtx) -> None:
                 "cardinality": rdef.cardinality,
                 "extraction_guidance": rdef.extraction_guidance,
                 "discovery_guidance": rdef.discovery_guidance,
+                "creation_mode": rdef.creation_mode,
                 "managed_by": ctx.tag,
             },
         )
@@ -730,7 +732,12 @@ async def export_package(
 
     if et_rows:
         spec["entity_types"] = [
-            {"name": et.name, "description": et.description, "guidance": et.guidance}
+            {
+                "name": et.name,
+                "description": et.description,
+                "guidance": et.guidance,
+                "creation_mode": et.creation_mode,
+            }
             for et in et_rows
         ]
 
@@ -830,6 +837,7 @@ async def export_package(
                     "cardinality": r.cardinality,
                     "extraction_guidance": r.extraction_guidance,
                     "discovery_guidance": r.discovery_guidance,
+                    "creation_mode": r.creation_mode,
                     "states": [
                         {
                             "name": s.name,

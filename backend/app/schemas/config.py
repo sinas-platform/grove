@@ -69,10 +69,14 @@ class DocumentClassPropertyOut(TimestampedOut, DocumentClassPropertyIn):
 # ─────────────────────────────────────────────────────────────
 # Entity types
 # ─────────────────────────────────────────────────────────────
+EntityCreationMode = Literal["open", "review", "closed"]
+
+
 class EntityTypeIn(BaseModel):
     name: str
     description: str | None = None
     guidance: str | None = None
+    creation_mode: EntityCreationMode = "open"
 
 
 class EntityTypeOut(TimestampedOut, EntityTypeIn):
@@ -95,6 +99,7 @@ class RelationshipDefinitionIn(BaseModel):
     cardinality: Literal["one", "many"] = "many"
     extraction_guidance: str | None = None
     discovery_guidance: str | None = None
+    creation_mode: EntityCreationMode = "open"
 
 
 class RelationshipDefinitionOut(TimestampedOut, RelationshipDefinitionIn):

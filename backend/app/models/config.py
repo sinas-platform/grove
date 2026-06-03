@@ -64,6 +64,10 @@ class EntityType(Base, TimestampMixin):
     name: Mapped[str] = mapped_column(String(200), nullable=False, unique=True)
     description: Mapped[str | None] = mapped_column(Text)
     guidance: Mapped[str | None] = mapped_column(Text)
+    # open | review | closed (see app/alembic/versions/0011_entity_gating.py)
+    creation_mode: Mapped[str] = mapped_column(
+        String(10), nullable=False, default="open", server_default="open"
+    )
     managed_by: Mapped[str | None] = mapped_column(String(128), index=True)
 
 
@@ -96,6 +100,10 @@ class RelationshipDefinition(Base, TimestampMixin):
     cardinality: Mapped[str] = mapped_column(String(10), default="many", nullable=False)
     extraction_guidance: Mapped[str | None] = mapped_column(Text)
     discovery_guidance: Mapped[str | None] = mapped_column(Text)
+    # open | review | closed (see 0013_relationship_gating.py)
+    creation_mode: Mapped[str] = mapped_column(
+        String(10), nullable=False, default="open", server_default="open"
+    )
     managed_by: Mapped[str | None] = mapped_column(String(128), index=True)
 
     states: Mapped[list["RelationshipState"]] = relationship(

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
@@ -21,10 +22,15 @@ from app.models import (
     Document,
     DocumentVersion,
     Entity,
+    EntityAlias,
     EntityMention,
+    EntityProposal,
+    EntityType,
     PropertyValue,
     Relationship,
+    RelationshipDefinition,
     RelationshipProposal,
+    UnresolvedEntityMention,
     UnresolvedRelationship,
 )
 from app.schemas.runtime import (
@@ -213,28 +219,155 @@ async def set_property_value(
 
 # ─────────────────────────── entities ───────────────────────────
 class EntityIn(BaseModel):
+    """Agent-facing 'find-or-create entity' payload.
+
+    The handler always tries an alias/canonical-form match first. On no match,
+    the EntityType's `creation_mode` decides:
+      - open    → insert an Entity row (legacy behavior)
+      - review  → insert an EntityProposal (needs human approval)
+      - closed  → don't create; if evidence (document_id + span) was supplied,
+                  park it as an UnresolvedEntityMention for review
+
+    The response `kind` tells the caller which table the id is in so it knows
+    whether it can immediately record an EntityMention or must wait for review.
+    """
+
     entity_type_id: uuid.UUID
     canonical_form: str
     extra_metadata: dict | None = None
+    # Optional evidence — required only for `closed` mode to park an
+    # unresolved mention; useful for `review` mode for context on approval.
+    document_id: uuid.UUID | None = None
+    document_version_id: uuid.UUID | None = None
+    span: dict | None = None
+    confidence: float | None = None
+    proposing_agent: str | None = None
+    reasoning: str | None = None
+
+
+class EntityResolution(BaseModel):
+    kind: Literal["entity", "proposal", "unresolved", "blocked"]
+    id: uuid.UUID | None = None
+    canonical_form: str
+    creation_mode: Literal["open", "review", "closed"]
+
+
+async def _alias_match(
+    session: AsyncSession, entity_type_id: uuid.UUID, canonical_form: str
+) -> Entity | None:
+    # Exact match on canonical_form first.
+    hit = (
+        await session.execute(
+            select(Entity).where(
+                Entity.entity_type_id == entity_type_id,
+                Entity.canonical_form == canonical_form,
+            )
+        )
+    ).scalar_one_or_none()
+    if hit is not None:
+        return hit
+    # Then alias.
+    aliased = (
+        await session.execute(
+            select(Entity)
+            .join(EntityAlias, EntityAlias.entity_id == Entity.id)
+            .where(
+                Entity.entity_type_id == entity_type_id,
+                EntityAlias.alias == canonical_form,
+            )
+        )
+    ).scalar_one_or_none()
+    return aliased
 
 
 @router.post(
     "/entities",
+    response_model=EntityResolution,
     status_code=status.HTTP_201_CREATED,
     dependencies=[Depends(require_permission("grove.ingestion.write:own"))],
 )
 async def propose_new_entity(
     payload: EntityIn, session: AsyncSession = Depends(get_session)
 ):
-    row = Entity(
-        entity_type_id=payload.entity_type_id,
+    et = await session.get(EntityType, payload.entity_type_id)
+    if et is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "entity type not found")
+
+    matched = await _alias_match(session, et.id, payload.canonical_form)
+    if matched is not None:
+        return EntityResolution(
+            kind="entity",
+            id=matched.id,
+            canonical_form=matched.canonical_form,
+            creation_mode=et.creation_mode,  # type: ignore[arg-type]
+        )
+
+    if et.creation_mode == "open":
+        row = Entity(
+            entity_type_id=et.id,
+            canonical_form=payload.canonical_form,
+            extra_metadata=payload.extra_metadata,
+        )
+        session.add(row)
+        await session.commit()
+        await session.refresh(row)
+        return EntityResolution(
+            kind="entity",
+            id=row.id,
+            canonical_form=row.canonical_form,
+            creation_mode="open",
+        )
+
+    if et.creation_mode == "review":
+        prop = EntityProposal(
+            entity_type_id=et.id,
+            canonical_form=payload.canonical_form,
+            extra_metadata=payload.extra_metadata,
+            proposing_agent=payload.proposing_agent,
+            reasoning=payload.reasoning,
+            evidence_document_id=payload.document_id,
+            evidence_span=payload.span,
+            confidence=payload.confidence,
+            status="pending",
+        )
+        session.add(prop)
+        await session.commit()
+        await session.refresh(prop)
+        return EntityResolution(
+            kind="proposal",
+            id=prop.id,
+            canonical_form=prop.canonical_form,
+            creation_mode="review",
+        )
+
+    # closed
+    if payload.document_id is not None and payload.span is not None:
+        mention = UnresolvedEntityMention(
+            entity_type_id=et.id,
+            mention_text=payload.canonical_form,
+            document_id=payload.document_id,
+            document_version_id=payload.document_version_id,
+            span=payload.span,
+            confidence=payload.confidence,
+            proposing_agent=payload.proposing_agent,
+            reasoning=payload.reasoning,
+            status="unresolved",
+        )
+        session.add(mention)
+        await session.commit()
+        await session.refresh(mention)
+        return EntityResolution(
+            kind="unresolved",
+            id=mention.id,
+            canonical_form=payload.canonical_form,
+            creation_mode="closed",
+        )
+    return EntityResolution(
+        kind="blocked",
+        id=None,
         canonical_form=payload.canonical_form,
-        extra_metadata=payload.extra_metadata,
+        creation_mode="closed",
     )
-    session.add(row)
-    await session.commit()
-    await session.refresh(row)
-    return {"id": row.id, "canonical_form": row.canonical_form}
 
 
 class EntityMentionInWithBody(BaseModel):
@@ -261,24 +394,64 @@ async def record_entity_mention(
 
 
 # ─────────────────────────── relationships ───────────────────────────
+async def _check_relationship_mode(
+    session: AsyncSession, relationship_definition_id: uuid.UUID
+) -> RelationshipDefinition:
+    rdef = await session.get(RelationshipDefinition, relationship_definition_id)
+    if rdef is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "relationship definition not found")
+    if rdef.creation_mode == "closed":
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"relationship '{rdef.name}' is locked — runtime extraction is not allowed for this definition",
+        )
+    return rdef
+
+
+class RelationshipResolution(BaseModel):
+    kind: Literal["relationship", "proposal"]
+    id: uuid.UUID
+    creation_mode: Literal["open", "review", "closed"]
+
+
 @router.post(
     "/relationships",
-    response_model=RelationshipOut,
+    response_model=RelationshipResolution,
     status_code=status.HTTP_201_CREATED,
     dependencies=[Depends(require_permission("grove.ingestion.write:own"))],
 )
 async def record_relationship(
     payload: RelationshipIn, session: AsyncSession = Depends(get_session)
 ):
+    rdef = await _check_relationship_mode(session, payload.relationship_definition_id)
     data = payload.model_dump()
     span = data.pop("evidence_span", None)
+
+    if rdef.creation_mode == "review":
+        # Translate the direct payload into a proposal. Drop `last_verified_at`
+        # (not relevant pre-approval) and map evidence fields verbatim.
+        prop = RelationshipProposal(
+            relationship_definition_id=data["relationship_definition_id"],
+            source_id=data["source_id"],
+            target_id=data["target_id"],
+            suggested_state_id=data.get("current_state_id"),
+            evidence_document_id=data.get("evidence_document_id"),
+            evidence_span=span,
+            confidence=data.get("confidence"),
+            status="pending",
+        )
+        session.add(prop)
+        await session.commit()
+        await session.refresh(prop)
+        return RelationshipResolution(kind="proposal", id=prop.id, creation_mode="review")
+
     row = Relationship(
         **data, evidence_span=span, last_verified_at=datetime.now(timezone.utc)
     )
     session.add(row)
     await session.commit()
     await session.refresh(row)
-    return row
+    return RelationshipResolution(kind="relationship", id=row.id, creation_mode="open")
 
 
 @router.post(
@@ -290,6 +463,7 @@ async def record_relationship(
 async def propose_relationship(
     payload: RelationshipProposalIn, session: AsyncSession = Depends(get_session)
 ):
+    await _check_relationship_mode(session, payload.relationship_definition_id)
     row = RelationshipProposal(**payload.model_dump(), status="pending")
     session.add(row)
     await session.commit()
@@ -310,6 +484,7 @@ async def record_unresolved_relationship(
     cited ECLI we haven't ingested), keyed by `target_key`. A resolver promotes
     it to a real Relationship once the target lands — see UnresolvedRelationship.
     """
+    await _check_relationship_mode(session, payload.relationship_definition_id)
     data = payload.model_dump()
     span = data.pop("evidence_span", None)
     row = UnresolvedRelationship(**data, evidence_span=span, status="unresolved")

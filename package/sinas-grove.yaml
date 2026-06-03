@@ -9,7 +9,7 @@ metadata:
 
 package:
   name: sinas-grove
-  version: "0.1.10"
+  version: "0.1.11"
   description: >
     Sinas Grove — stateful, multi-agent document indexing and retrieval. The
     runtime is generic; domain knowledge (document classes, properties,
@@ -258,7 +258,29 @@ spec:
               entity_type_id: { type: string, format: uuid }
               canonical_form: { type: string }
               extra_metadata: { type: object }
+              # Evidence — required when the EntityType is `closed` so the
+              # mention can be parked as an unresolved mention; useful for
+              # `review` mode to give reviewers context.
+              document_id: { type: string, format: uuid }
+              document_version_id: { type: string, format: uuid }
+              span: { type: object }
+              confidence: { type: number }
+              proposing_agent: { type: string }
+              reasoning: { type: string }
             required: [entity_type_id, canonical_form]
+          description: |
+            Find-or-create. Tries alias/canonical match first; on no match,
+            the EntityType's `creation_mode` decides what happens. The
+            response is `{kind, id, canonical_form, creation_mode}`:
+              - kind="entity"     → matched or open-mode insert. Use this id
+                                    with `record_entity_mention`.
+              - kind="proposal"   → review-mode: held for approval. DO NOT
+                                    call `record_entity_mention` (the id is a
+                                    proposal id, not an entity id).
+              - kind="unresolved" → closed-mode: mention has been parked. DO
+                                    NOT call `record_entity_mention`.
+              - kind="blocked"    → closed-mode without evidence. Always pass
+                                    document_id + span so this never happens.
 
         - name: record_entity_mention
           method: POST
@@ -1246,13 +1268,25 @@ spec:
              apply. Read each type's `guidance`.
           3. Call `read_document_content`.
           4. For each mention you find:
-              a. (Future: look up canonical entity via
-                 `get_known_entities` to dedupe.)
-              b. If new, call `propose_new_entity` to register a canonical
-                 form, then `record_entity_mention` linking the new entity
-                 to this document with the span.
-              c. If you've already seen the canonical form in this run,
-                 just call `record_entity_mention` with the existing id.
+              a. Call `propose_new_entity` with the canonical_form AND the
+                 evidence (`document_id`, `span`, `confidence`, and a short
+                 `reasoning`). This is find-or-create — the server matches
+                 against existing aliases first.
+              b. Inspect the returned `kind`:
+                  - "entity"     → call `record_entity_mention` with the
+                                   returned id.
+                  - "proposal"   → STOP for this mention. The entity is
+                                   pending human approval; the mention will
+                                   be recorded when it's approved.
+                  - "unresolved" → STOP for this mention. The EntityType is
+                                   locked and the server has parked your
+                                   mention for human review.
+                  - "blocked"    → bug: you forgot to pass evidence. Fix
+                                   your call.
+
+        ALWAYS pass `document_id` and `span` to `propose_new_entity` so that
+        locked-mode mentions can be parked. Without them the server returns
+        "blocked" and the mention is lost.
 
         Be conservative. False mentions are worse than missed mentions —
         downstream agents will rediscover important entities.
@@ -1278,10 +1312,17 @@ spec:
              each definition, read its `extraction_guidance`.
           2. For each definition where this document type can be a source
              or target (per source_ref_type / target_ref_type):
-              a. Read the document via `read_document_content`.
-              b. For each relationship instance you find:
+              a. SKIP definitions whose `creation_mode == "closed"` — the
+                 graph is curated and the server will refuse your call
+                 with HTTP 409.
+              b. Read the document via `read_document_content`.
+              c. For each relationship instance you find:
                   - if BOTH ends resolve to known nodes in the graph:
-                      • confidence ≥ 0.8: call `record_relationship`
+                      • confidence ≥ 0.8: call `record_relationship`. The
+                        response is `{kind, id, creation_mode}`. If the
+                        definition is in "review" mode, the server will
+                        return `kind="proposal"` — that's expected; the
+                        edge is queued for human approval.
                       • confidence < 0.8: call `propose_relationship`
                         (queues for human review)
                   - if the target is named but you cannot resolve it to a
@@ -1291,7 +1332,7 @@ spec:
                     `target_key_kind` (e.g. "ecli"). A resolver promotes it
                     to a real relationship when the target is later ingested.
                     Do NOT drop the cite — record it as unresolved.
-              c. Always include `evidence_document_id` and
+              d. Always include `evidence_document_id` and
                  `evidence_span`.
 
         Only extract relationships explicitly stated in the document.

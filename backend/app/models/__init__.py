@@ -29,12 +29,14 @@ from app.models.runtime import (
     Entity,
     EntityAlias,
     EntityMention,
+    EntityProposal,
     PropertyValue,
     Relationship,
     RelationshipProposal,
     Result,
     ResultDocument,
     ResultTrace,
+    UnresolvedEntityMention,
     UnresolvedRelationship,
 )
 
@@ -58,6 +60,8 @@ __all__ = [
     "Relationship",
     "RelationshipProposal",
     "UnresolvedRelationship",
+    "EntityProposal",
+    "UnresolvedEntityMention",
     "Result",
     "ResultDocument",
     "ResultTrace",

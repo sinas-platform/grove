@@ -61,6 +61,7 @@ class PackageEntityTypeEntry(_Strict):
     name: str
     description: str | None = None
     guidance: str | None = None
+    creation_mode: Literal["open", "review", "closed"] = "open"
 
 
 RefType = Literal["document_class", "entity_type", "dossier_class"]
@@ -85,6 +86,7 @@ class PackageRelationshipDefinitionEntry(_Strict):
     cardinality: Literal["one", "many"] = "many"
     extraction_guidance: str | None = None
     discovery_guidance: str | None = None
+    creation_mode: Literal["open", "review", "closed"] = "open"
     states: list[PackageRelationshipStateEntry] = Field(default_factory=list)
 
 

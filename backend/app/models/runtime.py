@@ -124,6 +124,79 @@ class EntityMention(Base, TimestampMixin):
     confidence: Mapped[float | None] = mapped_column(Float)
 
 
+class EntityProposal(Base, TimestampMixin):
+    """Proposed Entity awaiting human approval.
+
+    Created when the entity-extractor agent reports a mention against an
+    EntityType whose `creation_mode == 'review'` and no alias match exists.
+    Approval promotes the proposal to a real `Entity`.
+    """
+
+    __tablename__ = "entity_proposal"
+    __table_args__ = (
+        Index("ix_entity_proposal_pending", "status", postgresql_where="status = 'pending'"),
+    )
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    entity_type_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("entity_type.id", ondelete="CASCADE"), index=True
+    )
+    canonical_form: Mapped[str] = mapped_column(String(500), nullable=False)
+    extra_metadata: Mapped[dict | None] = mapped_column(JSONB)
+    proposing_agent: Mapped[str | None] = mapped_column(String(200))
+    reasoning: Mapped[str | None] = mapped_column(Text)
+    evidence_document_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("document.id", ondelete="SET NULL")
+    )
+    evidence_span: Mapped[dict | None] = mapped_column(JSONB)
+    confidence: Mapped[float | None] = mapped_column(Float)
+    status: Mapped[str] = mapped_column(String(20), default="pending", nullable=False, index=True)
+    reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reviewed_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    promoted_entity_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("entity.id", ondelete="SET NULL")
+    )
+
+
+class UnresolvedEntityMention(Base, TimestampMixin):
+    """A mention the extractor reported that didn't match anything when the
+    EntityType is `closed`. A reviewer can later match it to an existing
+    entity, promote it to a new entity, or dismiss it.
+    """
+
+    __tablename__ = "unresolved_entity_mention"
+    __table_args__ = (
+        Index(
+            "ix_unresolved_entity_mention_open",
+            "entity_type_id",
+            "mention_text",
+            postgresql_where="status = 'unresolved'",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    entity_type_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("entity_type.id", ondelete="CASCADE"), index=True
+    )
+    mention_text: Mapped[str] = mapped_column(String(500), nullable=False)
+    document_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("document.id", ondelete="CASCADE"), index=True
+    )
+    document_version_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    span: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    confidence: Mapped[float | None] = mapped_column(Float)
+    proposing_agent: Mapped[str | None] = mapped_column(String(200))
+    reasoning: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(
+        String(20), default="unresolved", nullable=False, index=True
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    resolved_by: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    resolved_entity_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("entity.id", ondelete="SET NULL")
+    )
+
+
 # ─────────────────────────────────────────────────────────────
 # Relationships (instances) and proposals
 # ─────────────────────────────────────────────────────────────

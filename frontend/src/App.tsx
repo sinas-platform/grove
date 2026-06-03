@@ -19,6 +19,7 @@ import DossierClassesPage from './pages/DossierClasses';
 import PlaybooksPage from './pages/Playbooks';
 import PackagesPage from './pages/Packages';
 import ProposalsPage from './pages/Proposals';
+import EntityReviewPage from './pages/EntityReview';
 import IngestionRunsPage from './pages/IngestionRuns';
 import DiscoveryPage from './pages/Discovery';
 import SinasStatusPage from './pages/SinasStatus';
@@ -58,6 +59,7 @@ export default function App() {
         <Route path="config/playbooks" element={<PlaybooksPage />} />
         <Route path="config/packages" element={<PackagesPage />} />
         <Route path="review/proposals" element={<ProposalsPage />} />
+        <Route path="review/entities" element={<EntityReviewPage />} />
         <Route path="ingestion/runs" element={<IngestionRunsPage />} />
         <Route path="discovery" element={<DiscoveryPage />} />
         <Route path="sinas-status" element={<SinasStatusPage />} />
