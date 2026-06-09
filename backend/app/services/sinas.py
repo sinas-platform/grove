@@ -126,7 +126,7 @@ class Management:
         resp = await self._client.get(
             f"/api/v1/packages/{name}", headers=self._bearer(token)
         )
-        if resp.status_code == 404:
+        if resp.status_code in (403, 404):
             return None
         resp.raise_for_status()
         return resp.json()
