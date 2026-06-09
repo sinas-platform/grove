@@ -164,13 +164,49 @@ async def materialize_run(session: AsyncSession, run: IngestionRun) -> int:
 # ─────────────────────────────────────────────────────────────
 
 
+# Explicit per-stage instruction. Each agent already carries a detailed system
+# prompt; the message just has to tell it to do its job on this document, in
+# plain imperative form. The earlier generic "Reprocess <id> for stage X" wording
+# read as orchestration jargon — the classifier replied conversationally ("I have
+# no reprocess function") instead of acting. {d} is filled with the document id.
+_STAGE_MESSAGE: dict[str, str] = {
+    "classifier": (
+        "Classify document {d}. Call get_document_classes, read the document "
+        "content, pick the best-matching class, and call set_document_class."
+    ),
+    "summarizer": (
+        "Summarize document {d}. Read its content and call set_document_summary "
+        "with a concise summary and a toc."
+    ),
+    "property_extractor": (
+        "Extract property values for document {d}. Get its class properties, "
+        "find each value in the content, and call set_property_value."
+    ),
+    "entity_extractor": (
+        "Extract entity mentions from document {d}. Get the entity types for its "
+        "class, then call propose_new_entity and record_entity_mention as needed."
+    ),
+    "relationship_extractor": (
+        "Extract relationships explicitly stated in document {d}. Get the "
+        "relationship definitions, then record each via the appropriate ingest op."
+    ),
+    "dossier_assigner": (
+        "Assign document {d} to dossiers where it fits. If no dossier classes "
+        "are configured, do nothing."
+    ),
+}
+
+
 def _build_stage_inputs(stage: str, doc_ids: list[uuid.UUID]) -> list[dict[str, Any]]:
+    instruction = _STAGE_MESSAGE.get(stage)
+    if instruction is None:
+        instruction = f"Process document {{d}} for the '{stage}' stage."
     return [
         {
             "input_variables": {"document_id": str(d), "stage": stage},
             "message": (
-                f"Reprocess document {d} for stage '{stage}'. "
-                "Run only this stage; do not invoke other agents."
+                instruction.format(d=d)
+                + " Work only on this document; do not invoke other agents."
             ),
         }
         for d in doc_ids
