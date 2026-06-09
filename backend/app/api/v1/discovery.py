@@ -597,6 +597,14 @@ async def _resolve_ref(
     return row.id
 
 
+def _hints_to_text(hints):
+    """Discovery may emit classification_hints as a list; the column is Text.
+    Join a list into newline-separated text; pass through strings/None."""
+    if isinstance(hints, list):
+        return "\n".join(str(h) for h in hints)
+    return hints
+
+
 async def _materialize_proposal(
     session: AsyncSession, kind: str, payload: dict, name: str
 ) -> uuid.UUID:
@@ -606,7 +614,7 @@ async def _materialize_proposal(
             slug=payload.get("slug") or slugify(name),
             name=name,
             description=payload.get("description"),
-            classification_hints=payload.get("classification_hints"),
+            classification_hints=_hints_to_text(payload.get("classification_hints")),
             summarization_guidance=payload.get("summarization_guidance"),
         )
     elif kind == "entity_type":
@@ -648,7 +656,7 @@ async def _materialize_proposal(
             description=payload.get("description"),
             guidance=payload.get("guidance"),
             summarization_guidance=payload.get("summarization_guidance"),
-            classification_hints=payload.get("classification_hints"),
+            classification_hints=_hints_to_text(payload.get("classification_hints")),
         )
     elif kind == "document_class_property":
         row = DocumentClassProperty(
