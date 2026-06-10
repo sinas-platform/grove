@@ -284,6 +284,39 @@ async def submit_run(
 # ─────────────────────────────────────────────────────────────
 
 
+# A unit can come back COMPLETED while the agent's final reply is actually a
+# rate-limit error: the agent catches the 429 from the LLM and returns it as
+# plain text, so the Sinas execution still looks successful. Detect that
+# signature in the chat transcript and treat the unit as failed, so it isn't
+# silently marked succeeded (and can be re-run). No retry here — just correct
+# status. Costs one chat fetch per completed unit during reconciliation.
+_RATE_LIMIT_MARKERS = ("rate_limit_error", "error code: 429", "429 -")
+
+
+async def _agent_reply_is_rate_limited(client: SinasClient, chat_id: str | None) -> bool:
+    if not chat_id:
+        return False
+    try:
+        chat = await asyncio.to_thread(client.chats.get, chat_id)
+    except SinasAPIError:
+        return False  # can't read the chat — don't override the reported status
+    for msg in reversed(chat.get("messages") or []):
+        if msg.get("role") != "assistant":
+            continue
+        content = msg.get("content")
+        if isinstance(content, list):
+            text = " ".join(
+                part.get("text", "")
+                for part in content
+                if isinstance(part, dict) and part.get("type") == "text"
+            )
+        else:
+            text = content or ""
+        low = text.lower()
+        return any(marker in low for marker in _RATE_LIMIT_MARKERS)
+    return False
+
+
 async def _reconcile_stage_units(
     client: SinasClient,
     run_id: uuid.UUID,
@@ -315,10 +348,18 @@ async def _reconcile_stage_units(
                     continue  # already reconciled
                 exec_status = (execution.get("status") or "").upper()
                 ok = exec_status == "COMPLETED"
+                chat_id = execution.get("chat_id") or unit.chat_id
+                rate_limited = ok and await _agent_reply_is_rate_limited(client, chat_id)
+                if rate_limited:
+                    ok = False
                 unit.status = "succeeded" if ok else "failed"
                 if not ok:
-                    unit.error = execution.get("error") or f"sinas: {exec_status}"
-                unit.chat_id = execution.get("chat_id") or unit.chat_id
+                    unit.error = (
+                        "agent hit an LLM rate limit (429) — marked failed for re-run"
+                        if rate_limited
+                        else execution.get("error") or f"sinas: {exec_status}"
+                    )
+                unit.chat_id = chat_id
                 unit.completed_at = datetime.now(timezone.utc)
                 run = await session.get(IngestionRun, run_id)
                 if run is not None:
