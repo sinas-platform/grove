@@ -13,7 +13,7 @@ from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import CallerIdentity, get_caller, require_permission
@@ -391,6 +391,67 @@ async def record_entity_mention(
     await session.commit()
     await session.refresh(row)
     return {"id": row.id}
+
+
+class FindEntityIn(BaseModel):
+    name: str
+    document_id: uuid.UUID
+
+
+class EntityMatch(BaseModel):
+    entity_id: uuid.UUID
+    canonical_form: str
+    mention_id: uuid.UUID
+    confidence: float | None = None
+
+
+@router.post(
+    "/find-entity",
+    response_model=list[EntityMatch],
+    dependencies=[Depends(require_permission("grove.ingestion.write:own"))],
+)
+async def find_entity_by_name(
+    payload: FindEntityIn, session: AsyncSession = Depends(get_session)
+):
+    """Resolve an entity name to entity IDs among the entities already mentioned
+    in a document.
+
+    The relationship extractor calls this to turn the names it reads in the text
+    into the source_id / target_id that record_relationship needs. Matching is
+    case-insensitive and partial (substring) against the entity's canonical form
+    and its aliases, so a short query like "Commission" returns candidates the
+    agent can pick from.
+    """
+    pattern = f"%{payload.name.strip()}%"
+    stmt = (
+        select(
+            EntityMention.id,
+            Entity.id,
+            Entity.canonical_form,
+            EntityMention.confidence,
+        )
+        .join(Entity, EntityMention.entity_id == Entity.id)
+        .outerjoin(EntityAlias, EntityAlias.entity_id == Entity.id)
+        .where(EntityMention.document_id == payload.document_id)
+        .where(
+            or_(
+                Entity.canonical_form.ilike(pattern),
+                EntityAlias.alias.ilike(pattern),
+            )
+        )
+        .distinct()
+        .limit(20)
+    )
+    rows = (await session.execute(stmt)).all()
+    return [
+        EntityMatch(
+            mention_id=mention_id,
+            entity_id=entity_id,
+            canonical_form=canonical_form,
+            confidence=confidence,
+        )
+        for mention_id, entity_id, canonical_form, confidence in rows
+    ]
 
 
 # ─────────────────────────── relationships ───────────────────────────

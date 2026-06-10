@@ -295,6 +295,23 @@ spec:
               confidence: { type: number }
             required: [document_id, entity_id, span]
 
+        - name: find_entity_by_name
+          method: POST
+          path: /api/v1/ingest/find-entity
+          parameters:
+            type: object
+            properties:
+              name: { type: string }
+              document_id: { type: string, format: uuid }
+            required: [name, document_id]
+          description: |
+            Resolve an entity name to entity IDs among the entities already
+            mentioned in this document. Returns a list of
+            {entity_id, canonical_form, mention_id, confidence}. Use the
+            entity_id as source_id / target_id for record_relationship.
+            Matching is partial and case-insensitive, so a short query like
+            "Commission" works; pick the right match from the returned list.
+
         - name: record_relationship
           method: POST
           path: /api/v1/ingest/relationships
@@ -1317,6 +1334,10 @@ spec:
                  with HTTP 409.
               b. Read the document via `read_document_content`.
               c. For each relationship instance you find:
+                  - resolve each end's name to an entity id with
+                    `find_entity_by_name(name, document_id)`. record_relationship
+                    takes entity IDs, not names; pick the right match from the
+                    returned list (matching is partial and case-insensitive).
                   - if BOTH ends resolve to known nodes in the graph:
                       • confidence ≥ 0.8: call `record_relationship`. The
                         response is `{kind, id, creation_mode}`. If the
@@ -1344,6 +1365,7 @@ spec:
             - get_document
             - get_relationship_definitions
             - read_document_content
+            - find_entity_by_name
             - record_relationship
             - propose_relationship
             - record_unresolved_relationship
