@@ -27,6 +27,7 @@ async def list_relationships(
     relationship_definition_id: uuid.UUID | None = None,
     source_id: uuid.UUID | None = None,
     target_id: uuid.UUID | None = None,
+    evidence_document_id: uuid.UUID | None = None,
     session: AsyncSession = Depends(get_session),
 ):
     stmt = select(Relationship)
@@ -36,6 +37,8 @@ async def list_relationships(
         stmt = stmt.where(Relationship.source_id == source_id)
     if target_id is not None:
         stmt = stmt.where(Relationship.target_id == target_id)
+    if evidence_document_id is not None:
+        stmt = stmt.where(Relationship.evidence_document_id == evidence_document_id)
     return (await session.execute(stmt)).scalars().all()
 
 
