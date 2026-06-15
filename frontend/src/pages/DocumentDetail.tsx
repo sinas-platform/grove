@@ -394,7 +394,7 @@ function EntitiesTab({ docId }: { docId: string }) {
 function RelationshipsTab({ docId }: { docId: string }) {
   const rels = useQuery({
     queryKey: ['document-relationships', docId],
-    queryFn: () => api<Relationship[]>(`/relationships?source_id=${docId}`),
+    queryFn: () => api<Relationship[]>(`/relationships?evidence_document_id=${docId}`),
   });
   const defs = useQuery({
     queryKey: ['relationship-definitions'],
