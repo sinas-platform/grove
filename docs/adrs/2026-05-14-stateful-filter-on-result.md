@@ -183,6 +183,16 @@ This gives the agent everything it needs in one round-trip: new state, new versi
 
 **To revisit if reversed:** unlikely to fully reverse, but the easiest partial rollback is to keep the schema columns and have agents pass `filter` explicitly to `introspect` again. The auto-trace contract is the part that's hardest to undo because it relocates a responsibility from the agent to the server.
 
+## 2026-06-09 addendum — field_filters narrow the count
+
+The original landing of this ADR shipped `apply_grove_filter` with field_filters intentionally excluded from the count subquery — the comment in `services/introspect.py` referred to an "ARCHITECTURE.md §13" that never made it into the repo, and the practical effect was that the agent's filter loop had no steering signal: adding `sector_targeted = Pharmaceutical` didn't change `candidate_count`, so the agent couldn't tell if its filter was doing anything.
+
+Fixed: field_filters now narrow the count subquery via `EXISTS` against `PropertyValue`, keyed by property name within the active `document_class_id`. Field name resolution is scoped to a class (you can't field_filter without one), which matches how the agent already drives the loop.
+
+Distributions take the standard **faceted** approach: every field's distribution narrows by all *other* field_filters but not by its own, so the agent can still see "what other sectors exist in my current narrowed set" without that filter hiding its own candidate values. `total_documents` per distribution reflects the facet base, not the global pre-filter total.
+
+Operator support in v1: `eq`, `in`, `neq`, `gte`, `lte`, `gt`, `lt`. Comparisons are text-cast on `value->'_'`, which works for ISO dates and exact strings. A typed-comparison variant (numeric / date cast) can be added when a real query needs it. `regex_filters` and dossier scoping remain TODO in `apply_grove_filter`.
+
 ## Out of scope for this ADR (follow-ups)
 
 - **Undo via trace.** `revert_to_trace(result_id, sequence)` could reset the filter to its state at a specific trace point. Useful for "agent went down the wrong path, back up three steps." Skip in v1; agent can manually mutate back.

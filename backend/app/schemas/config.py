@@ -155,11 +155,24 @@ class DossierClassPropertyOut(TimestampedOut, DossierClassPropertyIn):
 
 
 # ─────────────────────────────────────────────────────────────
-# Playbook scope
+# Playbooks (content + scope, both Grove-side)
 # ─────────────────────────────────────────────────────────────
+PlaybookKindLit = Literal["retrieval", "synthesis"]
+
+
+class PlaybookIn(BaseModel):
+    kind: PlaybookKindLit
+    name: str
+    description: str = ""
+    content: str = ""
+
+
+class PlaybookOut(TimestampedOut, PlaybookIn):
+    pass
+
+
 class PlaybookScopeIn(BaseModel):
-    skill_namespace: str
-    skill_name: str
+    playbook_id: uuid.UUID
     document_class_id: uuid.UUID | None = None
     dossier_class_id: uuid.UUID | None = None
 
@@ -169,8 +182,9 @@ class PlaybookScopeOut(TimestampedOut, PlaybookScopeIn):
 
 
 class PlaybookSummaryOut(ORMModel):
-    skill_namespace: str
-    skill_name: str
-    description: str | None = None
+    id: uuid.UUID
+    kind: PlaybookKindLit
+    name: str
+    description: str = ""
     applies_to_document_classes: list[uuid.UUID] = Field(default_factory=list)
     applies_to_dossier_classes: list[uuid.UUID] = Field(default_factory=list)

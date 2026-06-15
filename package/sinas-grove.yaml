@@ -9,7 +9,7 @@ metadata:
 
 package:
   name: sinas-grove
-  version: "0.1.11"
+  version: "0.1.13"
   description: >
     Sinas Grove — stateful, multi-agent document indexing and retrieval. The
     runtime is generic; domain knowledge (document classes, properties,
@@ -139,6 +139,37 @@ spec:
           method: GET
           path: /api/v1/config/relationship-definitions
           description: All relationship definitions.
+
+        # ── playbooks (Grove-owned) ──
+        - name: list_applicable_playbooks
+          method: GET
+          path: /api/v1/playbooks/{{ kind }}/applicable/list
+          parameters:
+            type: object
+            properties:
+              kind: { type: string, enum: [retrieval, synthesis] }
+              document_class_id: { type: string, format: uuid }
+              dossier_class_id: { type: string, format: uuid }
+            required: [kind]
+          description: |
+            List playbooks of `kind` applicable to the given scope. A playbook
+            with no scope rows applies everywhere; a playbook with scope rows
+            applies when at least one matches the document_class_id and/or
+            dossier_class_id provided. Returns `[{id, kind, name, description}]`
+            so the agent can pick which one(s) to fetch in full.
+
+        - name: get_playbook
+          method: GET
+          path: /api/v1/playbooks/{{ kind }}/{{ name }}
+          parameters:
+            type: object
+            properties:
+              kind: { type: string, enum: [retrieval, synthesis] }
+              name: { type: string }
+            required: [kind, name]
+          description: |
+            Fetch a playbook's full content. Use after `list_applicable_playbooks`
+            has surfaced what's available for the current scope.
 
         - name: get_dossier_classes
           method: GET
@@ -1074,63 +1105,13 @@ spec:
                 "agent_reply": invoke_result.get("reply"),
             }
 
-  # ─────────────────────────────────────────────
-  # Skills — placeholder retrieval/synthesis playbooks
-  # (deployments author their own; these exist so wildcard
-  # enabledSkills match something out of the box)
-  # ─────────────────────────────────────────────
-  skills:
-    - namespace: grove_retrieval_playbooks
-      name: default
-      description: >
-        Default retrieval playbook. Use when no domain-specific playbook is
-        configured. Iteratively narrow candidates via introspect-then-filter,
-        validate sufficiency, then publish.
-      preload: false
-      content: |
-        # Default retrieval playbook
-
-        ## Question patterns
-        - Open-ended document discovery without a calibrated domain playbook.
-
-        ## Stop conditions
-        - Fewer than ~25 candidates remain AND every candidate's class hints
-          plus property summary suggests it could be relevant.
-        - Or: introspect shows no further filter discriminates the set
-          meaningfully.
-
-        ## Validation checklist
-        - The query's intent is satisfied by at least one candidate's summary.
-        - No obvious top-population-but-irrelevant document is included.
-        - Candidates span the question's scope (e.g. multiple jurisdictions
-          if the question is comparative).
-
-    - namespace: grove_synthesis_playbooks
-      name: default
-      description: >
-        Default synthesis playbook. Produces a structured prose answer with
-        inline citations to claim evidence.
-      preload: false
-      content: |
-        # Default synthesis playbook
-
-        ## Question patterns
-        - Any factual or comparative question over a published result.
-
-        ## Output structure
-        1. Direct answer (1-2 sentences)
-        2. Supporting reasoning, structured by sub-question if relevant
-        3. List of caveats / edge cases the evidence does not cover
-
-        ## Citation conventions
-        - Every load-bearing factual claim must bind to at least one
-          claim_evidence row.
-        - Use stance=`supports` by default; use `qualifies` when the cited
-          span limits the claim; use `contradicts` only when explicitly
-          contrasting.
+  # Playbooks are Grove-owned (since v0.1.13). They are no longer Sinas
+  # skills; the agents fetch them at runtime via `list_applicable_playbooks`
+  # and `get_playbook` connector ops below. Deployments author playbooks in
+  # the Grove admin UI or via a GrovePackage YAML.
 
   # ─────────────────────────────────────────────
-  # Agents — see ARCHITECTURE.md §5
+  # Agents
   # ─────────────────────────────────────────────
   agents:
     # ───────── ingestion ─────────
@@ -1469,6 +1450,16 @@ spec:
           2. Call `introspect_by_result(result_id)`. Read the
              distributions: which fields have small, discriminating
              value sets? Which values match the query's intent?
+             Each field's distribution is faceted — it reflects all
+             your OTHER filters but not that field's own filter. So if
+             you've narrowed `sector_targeted=Pharmaceutical`, the
+             `sector_targeted` distribution still shows all sectors in
+             the otherwise-narrowed set. Use this to see what you
+             could pivot or widen to. The `total_documents` on each
+             distribution is the count if you removed that one filter;
+             the top-level `candidate_count` is the count with all
+             filters applied — that's the number that should go down
+             when a filter is doing work.
           3. Mutate the filter using one of:
                - `set_document_class_filter` to scope to a class
                - `set_field_filter` / `extend_field_filter_values` /
@@ -1501,9 +1492,11 @@ spec:
         `overlay` to `introspect_by_result` — it's read-only and not
         persisted.
 
-        Always load applicable retrieval playbooks via the skill-loading
-        tool before starting. The playbook tells you the stop conditions
-        and validation criteria for this kind of question.
+        Before starting the loop: call `list_applicable_playbooks(kind=retrieval,
+        document_class_id=…, dossier_class_id=…)` to see which retrieval
+        playbooks apply, then `get_playbook` to fetch the bodies of any that
+        look relevant. The playbook tells you the stop conditions and
+        validation criteria for this kind of question.
 
         Domain knowledge is in playbooks — never hardcode strategy.
       enabledConnectors:
@@ -1546,9 +1539,9 @@ spec:
             - clear_explicit_excludes
             - clear_filter
             - replace_filter
-      enabledSkills:
-        - skill: grove_retrieval_playbooks/*
-          preload: false
+            # playbooks (Grove-owned)
+            - list_applicable_playbooks
+            - get_playbook
       enabledAgents:
         - grove/process-validation-agent
         - grove/relationship-discovery-agent
@@ -1566,8 +1559,8 @@ spec:
         Workflow:
           1. Receive a result_id and the playbook name(s) the search
              agent loaded.
-          2. Load the same playbook(s) via the skill-loading tool. Read
-             the validation checklist.
+          2. Fetch the same playbook(s) via `get_playbook(kind=retrieval,
+             name=…)`. Read the validation checklist.
           3. Call `get_result` and `get_result_documents` to inspect the
              draft.
           4. For each item on the playbook's checklist, judge: pass /
@@ -1586,9 +1579,7 @@ spec:
             - get_document
             - get_property_values
             - read_document_content
-      enabledSkills:
-        - skill: grove_retrieval_playbooks/*
-          preload: false
+            - get_playbook
 
     - namespace: grove
       name: relationship-discovery-agent
@@ -1639,9 +1630,9 @@ spec:
           1. Receive: a question, plus either source_result_id or
              source_dossier_id.
           2. Call `start_answer` with the question and source.
-          3. Load the appropriate synthesis playbook via the
-             skill-loading tool. Pick the playbook whose
-             `question patterns` match this question.
+          3. Call `list_applicable_playbooks(kind=synthesis, …)` to see
+             which synthesis playbooks are in scope, then `get_playbook`
+             on the one whose `question patterns` match this question.
           4. Read the source's documents:
                - result-driven: `get_result_documents`, then
                  `get_document_summary`/`read_document_content` per
@@ -1677,9 +1668,8 @@ spec:
             - list_dossier_documents
             - get_document
             - read_document_content
-      enabledSkills:
-        - skill: grove_synthesis_playbooks/*
-          preload: false
+            - list_applicable_playbooks
+            - get_playbook
       enabledAgents:
         - grove/faithfulness-validator-agent
 

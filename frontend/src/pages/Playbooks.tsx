@@ -4,10 +4,11 @@ import { api } from '@/lib/api';
 import { PageHeader } from '@/components/PageHeader';
 
 interface Playbook {
-  namespace: string;
+  id: string;
+  kind: 'retrieval' | 'synthesis';
   name: string;
-  description: string | null;
-  content: string | null;
+  description: string;
+  content: string;
 }
 
 const KINDS: { value: 'retrieval' | 'synthesis'; label: string }[] = [
@@ -60,7 +61,7 @@ export default function PlaybooksPage({ embedded = false }: { embedded?: boolean
       {!embedded && (
         <PageHeader
           title="Playbooks"
-          description="Markdown skills agents load on demand. Stored in Sinas; managed here."
+          description="Markdown guidance the deep-search and synthesis agents fetch at runtime."
           actions={newButton}
         />
       )}
@@ -152,7 +153,7 @@ function PlaybookEditor({
     mutationFn: () =>
       api<Playbook>(`/playbooks/${kind}/${name}`, {
         method: 'PUT',
-        body: JSON.stringify({ name, description, content }),
+        body: JSON.stringify({ kind, name, description, content }),
       }),
     onSuccess: () => {
       setError(null);
@@ -171,7 +172,7 @@ function PlaybookEditor({
     <div className="space-y-3 p-4 border border-stone-200 rounded bg-white">
       <div className="flex items-center justify-between">
         <div className="font-mono text-xs text-stone-400">
-          grove_{kind}_playbooks/
+          {kind} playbook
         </div>
         {!isNew && (
           <button

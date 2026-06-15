@@ -189,19 +189,39 @@ class DossierClassDocumentClass(Base):
 
 
 # ─────────────────────────────────────────────────────────────
-# Playbook scope (skills live in Sinas; only the join lives here)
+# Playbooks (content + scope, both Grove-side)
 # ─────────────────────────────────────────────────────────────
-class PlaybookScope(Base, TimestampMixin):
-    """Maps a Sinas Skill (by namespace + name) to applicable classes.
+class Playbook(Base, TimestampMixin):
+    """Markdown playbook the deep-search / synthesis agents fetch via the
+    Grove connector. `kind` is `retrieval` or `synthesis`."""
 
-    Empty rows for a given skill mean 'applies everywhere'.
+    __tablename__ = "playbook"
+    __table_args__ = (UniqueConstraint("kind", "name", name="uq_playbook_kind_name"),)
+
+    id: Mapped[uuid.UUID] = uuid_pk()
+    kind: Mapped[str] = mapped_column(String(20), nullable=False)
+    name: Mapped[str] = mapped_column(String(200), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    content: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    managed_by: Mapped[str | None] = mapped_column(String(128), index=True)
+
+    scopes: Mapped[list["PlaybookScope"]] = relationship(
+        back_populates="playbook", cascade="all, delete-orphan"
+    )
+
+
+class PlaybookScope(Base, TimestampMixin):
+    """Assigns a Playbook to one or more applicable classes.
+
+    Zero scope rows for a playbook = applies everywhere. A row with both
+    class refs NULL is a sentinel meaning the same — used by the package
+    importer to track ownership of an everywhere-scoped playbook.
     """
 
     __tablename__ = "playbook_scope"
     __table_args__ = (
         UniqueConstraint(
-            "skill_namespace",
-            "skill_name",
+            "playbook_id",
             "document_class_id",
             "dossier_class_id",
             name="uq_playbook_scope",
@@ -209,8 +229,9 @@ class PlaybookScope(Base, TimestampMixin):
     )
 
     id: Mapped[uuid.UUID] = uuid_pk()
-    skill_namespace: Mapped[str] = mapped_column(String(200), nullable=False, index=True)
-    skill_name: Mapped[str] = mapped_column(String(200), nullable=False, index=True)
+    playbook_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("playbook.id", ondelete="CASCADE"), index=True
+    )
     document_class_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("document_class.id", ondelete="CASCADE")
     )
@@ -218,3 +239,5 @@ class PlaybookScope(Base, TimestampMixin):
         UUID(as_uuid=True), ForeignKey("dossier_class.id", ondelete="CASCADE")
     )
     managed_by: Mapped[str | None] = mapped_column(String(128), index=True)
+
+    playbook: Mapped[Playbook] = relationship(back_populates="scopes")

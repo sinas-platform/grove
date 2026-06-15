@@ -1,22 +1,19 @@
 """GrovePackage import / export service.
 
-Idempotent apply of a GrovePackage YAML against the Grove DB plus Sinas
-(for playbook skill content). Rows installed by a package are tagged
-`managed_by = pkg:<name>` so a re-import can prune resources that were
-removed from the manifest.
+Idempotent apply of a GrovePackage YAML against the Grove DB. Rows installed
+by a package are tagged `managed_by = pkg:<name>` so a re-import can prune
+resources that were removed from the manifest.
 
-Order of operations on apply:
+Order of operations on apply (single transaction):
   1. Parse + structural validate the YAML.
   2. Cross-ref validate (relationships reference existing names, etc.).
-  3. Push playbook skills to Sinas first (errors abort before any Grove
-     DB write — the Grove transaction never starts if Sinas is unreachable).
-  4. Single Grove DB transaction:
-       entity_types → document_classes (+ properties + entity-type links)
-       → dossier_classes (+ properties + document-class links)
-       → relationship_definitions (+ states)
-       → playbook_scope rows.
-  5. If prune=True, delete managed_by-tagged rows / Sinas skills not in
-     the manifest.
+  3. entity_types → document_classes (+ properties + entity-type links)
+     → dossier_classes (+ properties + document-class links)
+     → relationship_definitions (+ states)
+     → playbooks (+ scope rows).
+  4. If prune=True, delete managed_by-tagged rows not in the manifest.
+
+Playbook content is Grove-owned (see migration 0014). No Sinas writes.
 """
 
 from __future__ import annotations
@@ -37,6 +34,7 @@ from app.models import (
     DossierClassDocumentClass,
     DossierClassProperty,
     EntityType,
+    Playbook,
     PlaybookScope,
     RelationshipDefinition,
     RelationshipState,
@@ -49,12 +47,6 @@ from app.schemas.package import (
     PackagePlaybookEntry,
     PackageValidateResult,
 )
-from app.services.sinas import Management
-
-PLAYBOOK_NAMESPACE_FOR = {
-    "retrieval": "grove_retrieval_playbooks",
-    "synthesis": "grove_synthesis_playbooks",
-}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -146,8 +138,6 @@ class _ApplyCtx:
     pkg: GrovePackage
     tag: str
     session: AsyncSession
-    mgmt: Management
-    sinas_token: str
     prune: bool
     diff: PackageDiff = field(default_factory=PackageDiff)
     warnings: list[str] = field(default_factory=list)
@@ -156,8 +146,6 @@ class _ApplyCtx:
 async def apply(
     yaml_text: str,
     session: AsyncSession,
-    mgmt: Management,
-    sinas_token: str,
     prune: bool = True,
 ) -> PackageImportResult:
     pkg, parse_errors = parse_package(yaml_text)
@@ -172,23 +160,17 @@ async def apply(
         pkg=pkg,
         tag=_tag(pkg),
         session=session,
-        mgmt=mgmt,
-        sinas_token=sinas_token,
         prune=prune,
         warnings=list(warnings),
     )
 
-    # 1. Sinas-side writes first — if Sinas is unreachable, Grove stays untouched.
-    await _push_playbook_skills(ctx)
-
-    # 2. Grove DB writes in dependency order.
+    # All writes happen in this transaction.
     await _apply_entity_types(ctx)
     await _apply_document_classes(ctx)
     await _apply_dossier_classes(ctx)
     await _apply_relationship_definitions(ctx)
-    await _apply_playbook_scopes(ctx)
+    await _apply_playbooks(ctx)
 
-    # 3. Prune resources from prior installs not in the manifest.
     if prune:
         await _prune(ctx)
 
@@ -571,16 +553,14 @@ async def _apply_relationship_definitions(ctx: _ApplyCtx) -> None:
 
 
 # ────────── playbooks ──────────
-async def _push_playbook_skills(ctx: _ApplyCtx) -> None:
-    for pb in ctx.pkg.spec.playbooks:
-        ns = PLAYBOOK_NAMESPACE_FOR[pb.kind]
-        await ctx.mgmt.upsert_skill(
-            ctx.sinas_token, ns, pb.name, pb.description, pb.content
-        )
+async def _apply_playbooks(ctx: _ApplyCtx) -> None:
+    """Upsert Playbook content + reconcile PlaybookScope rows.
 
-
-async def _apply_playbook_scopes(ctx: _ApplyCtx) -> None:
-    # Resolve target classes by name once.
+    Per playbook: find-or-create the `playbook` row, update description/content,
+    then wipe-and-rewrite its scope rows from the manifest. A playbook with an
+    empty `scope` list still gets a sentinel row (both class refs NULL) tagged
+    `managed_by` so prune can identify it as belonging to this package.
+    """
     dc_by_name = {
         dc.name: dc
         for dc in (await ctx.session.execute(select(DocumentClass))).scalars().all()
@@ -589,23 +569,45 @@ async def _apply_playbook_scopes(ctx: _ApplyCtx) -> None:
         d.name: d
         for d in (await ctx.session.execute(select(DossierClass))).scalars().all()
     }
-
-    # Wipe existing managed scope rows for this package's playbooks, then re-add
-    # from the manifest. Cleaner than a per-row diff given the composite key.
-    pb_keys = {(PLAYBOOK_NAMESPACE_FOR[pb.kind], pb.name) for pb in ctx.pkg.spec.playbooks}
-    if pb_keys:
-        rows = (
+    existing_by_key = {
+        (p.kind, p.name): p
+        for p in (
             await ctx.session.execute(
-                select(PlaybookScope).where(PlaybookScope.managed_by == ctx.tag)
+                select(Playbook).where(Playbook.managed_by == ctx.tag)
             )
         ).scalars().all()
-        for r in rows:
-            if (r.skill_namespace, r.skill_name) in pb_keys:
-                await ctx.session.delete(r)
-        await ctx.session.flush()
+    }
 
     for pb in ctx.pkg.spec.playbooks:
-        ns = PLAYBOOK_NAMESPACE_FOR[pb.kind]
+        row = existing_by_key.get((pb.kind, pb.name)) or (
+            await ctx.session.execute(
+                select(Playbook).where(Playbook.kind == pb.kind, Playbook.name == pb.name)
+            )
+        ).scalar_one_or_none()
+        created = row is None
+        if row is None:
+            row = Playbook(kind=pb.kind, name=pb.name)
+            ctx.session.add(row)
+            await ctx.session.flush()
+        changed = _assign_if_changed(
+            row,
+            {
+                "description": pb.description,
+                "content": pb.content,
+                "managed_by": ctx.tag,
+            },
+        )
+
+        # Wipe-then-rewrite the scope rows for this playbook.
+        old_scopes = (
+            await ctx.session.execute(
+                select(PlaybookScope).where(PlaybookScope.playbook_id == row.id)
+            )
+        ).scalars().all()
+        for s in old_scopes:
+            await ctx.session.delete(s)
+        await ctx.session.flush()
+
         scope_entries = pb.scope or [None]  # sentinel for "applies everywhere"
         for s in scope_entries:
             dc_id = None
@@ -617,15 +619,14 @@ async def _apply_playbook_scopes(ctx: _ApplyCtx) -> None:
                     doss_id = doss_by_name[s.dossier_class].id
             ctx.session.add(
                 PlaybookScope(
-                    skill_namespace=ns,
-                    skill_name=pb.name,
+                    playbook_id=row.id,
                     document_class_id=dc_id,
                     dossier_class_id=doss_id,
                     managed_by=ctx.tag,
                 )
             )
-        _track(ctx.diff, f"playbook/{pb.kind}", pb.name, True, False)
-    await ctx.session.flush()
+        await ctx.session.flush()
+        _track(ctx.diff, f"playbook/{pb.kind}", pb.name, created, changed)
 
 
 # ────────── prune ──────────
@@ -655,29 +656,18 @@ async def _prune(ctx: _ApplyCtx) -> None:
                 await ctx.session.delete(r)
                 ctx.diff.deleted.append(f"{kind}/{r.name}")
 
-    # Playbooks: any (namespace, name) tagged for this package and NOT in the
-    # manifest is deleted from Sinas + from Grove scope rows.
-    manifest_pb = {
-        (PLAYBOOK_NAMESPACE_FOR[pb.kind], pb.name) for pb in ctx.pkg.spec.playbooks
-    }
-    rows = (
+    # Playbooks: any (kind, name) tagged for this package and NOT in the
+    # manifest is deleted (cascades to its scope rows via FK).
+    manifest_pb = {(pb.kind, pb.name) for pb in ctx.pkg.spec.playbooks}
+    pb_rows = (
         await ctx.session.execute(
-            select(PlaybookScope).where(PlaybookScope.managed_by == ctx.tag)
+            select(Playbook).where(Playbook.managed_by == ctx.tag)
         )
     ).scalars().all()
-    tagged_pb = {(r.skill_namespace, r.skill_name) for r in rows}
-    stale = tagged_pb - manifest_pb
-    for r in rows:
-        if (r.skill_namespace, r.skill_name) in stale:
-            await ctx.session.delete(r)
-    for ns, name in stale:
-        try:
-            await ctx.mgmt.delete_skill(ctx.sinas_token, ns, name)
-            ctx.diff.deleted.append(f"playbook/{ns}/{name}")
-        except Exception as exc:  # noqa: BLE001
-            ctx.warnings.append(
-                f"failed to delete stale skill {ns}/{name} from Sinas: {exc}"
-            )
+    for pb in pb_rows:
+        if (pb.kind, pb.name) not in manifest_pb:
+            await ctx.session.delete(pb)
+            ctx.diff.deleted.append(f"playbook/{pb.kind}/{pb.name}")
 
     await ctx.session.flush()
 
@@ -688,8 +678,6 @@ async def _prune(ctx: _ApplyCtx) -> None:
 async def export_package(
     name: str,
     session: AsyncSession,
-    mgmt: Management,
-    sinas_token: str,
     version: str = "0.0.0",
 ) -> str:
     """Export all rows tagged `pkg:<name>` (plus their nested resources) as YAML."""
@@ -850,24 +838,20 @@ async def export_package(
             )
         spec["relationship_definitions"] = out_rdef
 
-    # Playbooks: managed scope rows tell us which skills belong to the package.
+    # Playbooks: managed Playbook rows directly. Scope is fetched per-playbook.
     pb_rows = (
         await session.execute(
-            select(PlaybookScope).where(PlaybookScope.managed_by == tag)
+            select(Playbook).where(Playbook.managed_by == tag).order_by(Playbook.kind, Playbook.name)
         )
     ).scalars().all()
-    by_skill: dict[tuple[str, str], list[PlaybookScope]] = {}
-    for row in pb_rows:
-        by_skill.setdefault((row.skill_namespace, row.skill_name), []).append(row)
-    if by_skill:
+    if pb_rows:
         out_pb = []
-        kind_for_ns = {v: k for k, v in PLAYBOOK_NAMESPACE_FOR.items()}
-        for (ns, sk_name), scope_rows in by_skill.items():
-            if ns not in kind_for_ns:
-                continue
-            skill = await mgmt.get_skill(sinas_token, ns, sk_name)
-            content = (skill or {}).get("content", "")
-            description = (skill or {}).get("description", "")
+        for pb in pb_rows:
+            scope_rows = (
+                await session.execute(
+                    select(PlaybookScope).where(PlaybookScope.playbook_id == pb.id)
+                )
+            ).scalars().all()
             scope_out: list[dict[str, str]] = []
             for s in scope_rows:
                 if s.document_class_id is None and s.dossier_class_id is None:
@@ -880,10 +864,10 @@ async def export_package(
                 scope_out.append(entry)
             out_pb.append(
                 {
-                    "kind": kind_for_ns[ns],
-                    "name": sk_name,
-                    "description": description,
-                    "content": content,
+                    "kind": pb.kind,
+                    "name": pb.name,
+                    "description": pb.description,
+                    "content": pb.content,
                     "scope": scope_out,
                 }
             )
