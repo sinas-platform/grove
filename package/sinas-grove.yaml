@@ -1492,15 +1492,24 @@ spec:
           5. Repeat 2–4 until either the candidate set matches your
              playbook's stop conditions, or introspect shows no further
              filter discriminates the set meaningfully.
-          6. Call `add_files_to_result` with the surviving candidates
-             (use `get_result_documents` if you've staged inclusions via
-             explicit_includes already).
-          7. Invoke `process-validation-agent` to check the draft
+          6. After narrowing the candidates with introspect, call
+             `matching_documents` to get the actual document IDs.
+             Introspect only returns counts and distributions, so this
+             is the only way to learn WHICH documents the filter selected.
+          7. Call `add_files_to_result` with those document IDs to include
+             them in the Result (also pull any you staged via
+             explicit_includes — `get_result_documents` shows what's
+             already attached).
+          8. Invoke `process-validation-agent` to check the draft
              against the playbook criteria. If it passes, return. If
              not, mutate the filter and retry.
-          8. Optionally call `relationship-discovery-agent` to surface
+          9. Optionally call `relationship-discovery-agent` to surface
              additional relationships that might inform the user (the
              discovery agent only writes proposals, never facts).
+
+        Never publish a Result without first retrieving the document IDs
+        via `matching_documents` and adding them with `add_files_to_result`
+        — a Result with a filter but no attached documents is empty.
 
         Probe before commit: if you want to know "what would happen if I
         added jurisdiction=FR?" without committing the change, pass an
