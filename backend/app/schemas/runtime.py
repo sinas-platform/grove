@@ -311,3 +311,12 @@ class IntrospectFieldDistribution(ORMModel):
 class IntrospectOut(BaseModel):
     candidate_count: int
     distributions: list[IntrospectFieldDistribution]
+
+
+class MatchingDocumentsIn(BaseModel):
+    filter: GroveFilter | None = None
+    limit: int = Field(default=50, ge=1, le=200)
+
+
+class MatchingDocumentsOut(BaseModel):
+    document_ids: list[uuid.UUID]

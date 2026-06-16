@@ -21,8 +21,10 @@ from app.schemas.runtime import (
     GroveFilter,
     IntrospectIn,
     IntrospectOut,
+    MatchingDocumentsIn,
+    MatchingDocumentsOut,
 )
-from app.services.introspect import introspect_with_filter
+from app.services.introspect import introspect_with_filter, matching_document_ids
 
 router = APIRouter(prefix="/retrieval", tags=["retrieval"])
 
@@ -38,6 +40,23 @@ async def introspect(
     persisted filter and avoids re-emitting it on every iteration."""
     f = payload.filter or GroveFilter()
     return await introspect_with_filter(session, caller, f, payload.fields, payload.top_k)
+
+
+@router.post("/matching-documents", response_model=MatchingDocumentsOut)
+async def matching_documents(
+    payload: MatchingDocumentsIn,
+    session: AsyncSession = Depends(get_session),
+    caller: CallerIdentity = Depends(get_caller),
+):
+    """Enumerate the document ids matching the filter.
+
+    Companion to `/introspect`: introspect answers HOW MANY documents match and
+    their value distribution; this answers WHICH ones, so the agent can add them
+    to a Result. Same filter body and query logic, capped by `limit` (default
+    50, max 200)."""
+    f = payload.filter or GroveFilter()
+    ids = await matching_document_ids(session, caller, f, payload.limit)
+    return MatchingDocumentsOut(document_ids=ids)
 
 
 # ───────────────────── draft result mutation operations ─────────────────────
