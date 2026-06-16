@@ -436,6 +436,21 @@ spec:
                 items: { type: string }
               top_k: { type: integer }
 
+        - name: matching_documents
+          method: POST
+          path: /api/v1/retrieval/matching-documents
+          parameters:
+            type: object
+            properties:
+              filter: { type: object }
+              limit: { type: integer, default: 50 }
+          description: |
+            Enumerate the document ids matching the filter — the companion to
+            `introspect`, which only returns counts and value distributions.
+            Same filter body as introspect. Returns {document_ids: [...]},
+            capped by `limit` (default 50, max 200). Use it to pull the actual
+            matches into a draft Result via `add_files_to_result`.
+
         - name: create_draft_result
           method: POST
           path: /api/v1/retrieval/results
@@ -1505,6 +1520,7 @@ spec:
             # introspect + result lifecycle
             - introspect
             - introspect_by_result
+            - matching_documents
             - get_document
             - get_property_values
             - read_document_content
