@@ -320,13 +320,24 @@ async def submit_run(
 # ─────────────────────────────────────────────────────────────
 
 
-# A unit can come back COMPLETED while the agent's final reply is actually a
-# rate-limit error: the agent catches the 429 from the LLM and returns it as
-# plain text, so the Sinas execution still looks successful. Detect that
-# signature in the chat transcript and treat the unit as failed, so it isn't
-# silently marked succeeded (and can be re-run). No retry here — just correct
-# status. Costs one chat fetch per completed unit during reconciliation.
-_RATE_LIMIT_MARKERS = ("rate_limit_error", "error code: 429", "429 -")
+# A unit can come back COMPLETED while the agent's final reply is actually an
+# LLM provider error returned as plain text. The agent catches the error (a 429
+# rate limit, or a 400 spend/usage cap) and returns it as its message, so the
+# Sinas execution still looks successful. Detect that signature in the chat
+# transcript and treat the unit as failed, so it isn't silently marked succeeded
+# (and can be re-run). No retry here, just correct status. Costs one chat fetch
+# per completed unit during reconciliation. Markers match case-insensitively.
+_RATE_LIMIT_MARKERS = (
+    "rate_limit_error",
+    "error code: 429",
+    "429 -",
+    # Account spend / usage cap. Anthropic returns this as a 400, which the
+    # 429 markers above miss. This is what caused silent empty-success
+    # ingestion: the unit reported COMPLETED but wrote no data.
+    "usage limits",
+    "api usage limits",
+    "you have reached your specified api usage limits",
+)
 
 
 async def _agent_reply_is_rate_limited(client: SinasClient, chat_id: str | None) -> bool:
