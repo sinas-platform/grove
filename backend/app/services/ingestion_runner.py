@@ -337,6 +337,12 @@ _RATE_LIMIT_MARKERS = (
     "usage limits",
     "api usage limits",
     "you have reached your specified api usage limits",
+    # Context-length overflow. A doc larger than the model context window
+    # returns a 400 ("prompt is too long: N tokens > 200000 maximum"). The
+    # message differs from the usage-cap one above, so without these markers
+    # an oversized doc would also be marked succeeded with no data written.
+    "prompt is too long",
+    "too many tokens",
 )
 
 
