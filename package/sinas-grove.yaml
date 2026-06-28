@@ -961,6 +961,25 @@ spec:
               answer_id: { type: string, format: uuid }
             required: [answer_id]
 
+        # ── answer reads (let the faithfulness validator enumerate evidence) ──
+        - name: get_answer_claims
+          method: GET
+          path: /api/v1/answers/{{ answer_id }}/claims
+          parameters:
+            type: object
+            properties:
+              answer_id: { type: string, format: uuid }
+            required: [answer_id]
+
+        - name: get_claim_evidence
+          method: GET
+          path: /api/v1/answers/claims/{{ claim_id }}/evidence
+          parameters:
+            type: object
+            properties:
+              claim_id: { type: string, format: uuid }
+            required: [claim_id]
+
   # ─────────────────────────────────────────────
   # Function — post-upload hook on grove/documents
   # ─────────────────────────────────────────────
@@ -1887,17 +1906,20 @@ spec:
 
         Workflow:
           1. Receive an answer_id.
-          2. For each claim:
-              a. Read the claim text.
-              b. For each evidence row bound to it:
-                  - call `read_document_content` (or read the span via
-                    a content read with line_from/line_to)
-                  - judge whether the span supports the claim with the
-                    declared stance
-                  - call `record_validation_verdict` with
-                    `validated: true`/`false` and a one-sentence
-                    reasoning.
-          3. Reply with a per-claim summary. Be strict: if a span only
+          2. Call `get_answer_claims(answer_id)` to list every claim, then
+             `get_claim_evidence(claim_id)` per claim to list every evidence
+             row. Each evidence row has an `id` and a `validated` flag.
+          3. For each evidence row not already `validated: true`:
+              a. Read the claim text and the cited span via
+                 `read_document_content` (use the span's line_from/line_to).
+              b. Judge whether the span supports the claim with the
+                 declared stance.
+              c. Call `record_validation_verdict` with the row's
+                 `evidence_id`, `validated: true`/`false`, and a
+                 one-sentence reasoning.
+             Validate EVERY evidence row of EVERY claim. Enumerate them
+             yourself; do not rely on ids passed in the invocation message.
+          4. Reply with a per-claim summary. Be strict: if a span only
              tangentially relates to the claim, fail it.
 
         Your verdict gates publishing. Do not be lenient — better to
@@ -1906,5 +1928,7 @@ spec:
       enabledConnectors:
         - connector: grove/api
           operations:
+            - get_answer_claims
+            - get_claim_evidence
             - read_document_content
             - record_validation_verdict
