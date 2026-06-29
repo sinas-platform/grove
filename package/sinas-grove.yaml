@@ -1446,9 +1446,15 @@ spec:
              `parent_result_id` linkage.
           4. Append a final trace entry summarizing the orchestration.
           5. Call `publish_result` on the parent.
+          6. After the parent result is published, invoke
+             `synthesis-agent` with the original user question and
+             `source_result_id` set to the published parent result's
+             id. It drafts a claim-bound, faithfulness-validated answer
+             from the retrieved documents and publishes it.
 
         Single-shot queries don't need decomposition — invoke
-        `deep-search-agent` once and publish its result directly.
+        `deep-search-agent` once, publish its result, then invoke
+        `synthesis-agent` on that published result.
       enabledConnectors:
         - connector: grove/api
           operations:
@@ -1459,6 +1465,7 @@ spec:
             - get_result
       enabledAgents:
         - grove/deep-search-agent
+        - grove/synthesis-agent
 
     - namespace: grove
       name: deep-search-agent
