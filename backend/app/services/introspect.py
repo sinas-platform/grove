@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import literal
 
 from app.auth import CallerIdentity
-from app.models import Document, DocumentClassProperty, PropertyValue
+from app.models import Document, DocumentClassProperty, DocumentVersion, PropertyValue
 from app.schemas.runtime import (
     FieldFilter,
     GroveFilter,
@@ -136,8 +136,8 @@ def apply_grove_filter(
             Document.id.in_(
                 select(sql_text("document_version.document_id"))
                 .select_from(sql_text("document_version"))
-                .where(sql_text("content_tsvector @@ plainto_tsquery(:q)"))
-                .params(q=f.text_search)
+                .where(sql_text("content_tsvector @@ websearch_to_tsquery(:q)"))
+                .params(q=" OR ".join(f.text_search.split()))
             )
         )
     if f.document_class_id is not None and f.field_filters:
@@ -169,15 +169,33 @@ async def matching_document_ids(
 
     Same selection logic as `count_candidates` — visibility scope plus
     `apply_grove_filter` — but enumerates the matches so the caller can pull
-    them into a Result. `DISTINCT` guards against row fan-out if a future
-    clause joins; ordered by id for stable truncation under `limit`.
+    them into a Result. When a text search is active, results are ordered by FTS
+    relevance (`ts_rank` on the current version) so the top `limit` are the best
+    matches; otherwise ordered by id for stable truncation. The version join is
+    1:1 on `current_version_id`, so no `DISTINCT` is needed in that branch.
     """
     read_all = await caller.has_permission("grove.documents.read:all")
     stmt = select(Document.id).where(
         visible_clause(Document, caller, read_all=read_all)
     )
     stmt = apply_grove_filter(stmt, f)
-    stmt = stmt.distinct().order_by(Document.id).limit(limit)
+    if f.text_search:
+        # Rank by relevance against the same OR-joined query the filter matched
+        # on, via an explicit 1:1 join to the current version. content_tsvector
+        # is a mapped column, so this stays pure ORM.
+        or_query = " OR ".join(f.text_search.split())
+        rank = func.ts_rank(
+            DocumentVersion.content_tsvector, func.websearch_to_tsquery(or_query)
+        )
+        stmt = (
+            stmt.join(
+                DocumentVersion, DocumentVersion.id == Document.current_version_id
+            )
+            .order_by(rank.desc(), Document.id)
+            .limit(limit)
+        )
+    else:
+        stmt = stmt.distinct().order_by(Document.id).limit(limit)
     rows = (await session.execute(stmt)).scalars().all()
     return list(rows)
 
