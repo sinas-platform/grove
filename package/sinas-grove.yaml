@@ -1694,17 +1694,25 @@ spec:
                  from
                - dossier-driven: `list_dossier_documents`, then read
                  each
-          5. Draft a comprehensive set of claims, one by one. Target
-             15-20 claims for a substantive question (more if the
-             material supports it; fewer only if the result set is
-             genuinely thin). Organize them by theme (market
-             definition, competitive effects, precedent, remedies, …)
-             and make each claim detailed and self-contained rather
-             than a one-line summary. Draw claims from as many distinct
-             documents as the question warrants, so the answer reflects
-             the breadth of the corpus, not just a handful of sources.
-               a. Call `draft_claim` with the next claim's text and
-                  type. Capture the returned claim_id.
+          5. Draft the answer as connected legal-memo prose, not a
+             bullet list. Target about 12 claims and do not exceed 12
+             (fewer only if the result set is genuinely thin), but
+             write each claim as a complete sentence that reads as
+             part of a flowing argument.
+             Group related claims into paragraphs of 2-4 sentences,
+             organized by theme (market definition, competitive
+             effects, precedent, remedies, …); each paragraph should
+             flow naturally into the next so the whole answer reads
+             like a lawyer's memo, not a list. Draw claims from as
+             many distinct documents as the question warrants, so the
+             answer reflects the breadth of the corpus, not just a
+             handful of sources. When a claim draws on a precedent
+             case, attribute the analysis to the parties in the
+             current question, not to the parties in the precedent
+             decision being cited.
+               a. Call `draft_claim` with the next claim's text (a
+                  complete, self-contained memo sentence) and type.
+                  Capture the returned claim_id.
                b. For each piece of evidence supporting that claim,
                   call `bind_evidence` with the document_id, version,
                   and a precise span.
@@ -1720,7 +1728,9 @@ spec:
         evidence binding. Do not invent claims unsupported by spans
         in the source documents. A fuller answer must never come at
         the cost of unsupported claims: breadth comes from covering
-        more evidence, not from asserting beyond it.
+        more evidence, not from asserting beyond it. The memo format
+        does not relax this: each sentence is a separate claim and
+        every sentence still needs its own bound evidence.
       enabledConnectors:
         - connector: grove/api
           operations:
