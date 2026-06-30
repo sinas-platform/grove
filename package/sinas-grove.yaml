@@ -1448,19 +1448,37 @@ spec:
              id from every invocation; do not discard any.
           3. MERGE (required, never skip; applies even when there is only
              one sub-result):
-               a. Call `create_draft_result` with the user's original
+               a. For EVERY sub-result id from step 2, call
+                  `get_result_documents` and record how many documents it
+                  has. A sub-result with zero documents is empty (its
+                  deep-search timed out or found nothing) and must be
+                  excluded from the merge.
+               b. Build the deduplicated union of document ids from the
+                  NON-EMPTY sub-results. If that union is empty (every
+                  sub-result was empty), do NOT create or publish a parent:
+                  re-invoke `deep-search-agent` for the (sub)queries that
+                  produced nothing and repeat from step 2. If it is still
+                  empty after a second attempt, STOP: append a trace entry
+                  and reply that retrieval failed. Never publish an empty
+                  result.
+               c. Call `create_draft_result` with the user's original
                   question as `query`. This new result is the single
                   parent.
-               b. For each sub-result id from step 2, call
-                  `get_result_documents` to read its document ids.
-               c. Call `add_files_to_result` on the PARENT with the union
-                  of every sub-result's document ids (deduplicated),
-                  giving a `reason` that names the merge. Do not pick one
-                  sub-result and drop the others.
+               d. Call `add_files_to_result` on the PARENT with the union
+                  from step b. This call is MANDATORY; you may not reach
+                  step 5 without it succeeding.
+               e. Confirm the merge: call `get_result_documents` on the
+                  PARENT and check its document count equals the size of
+                  the union. If the parent has zero documents, the merge
+                  failed; retry step d. Do not proceed while the parent is
+                  empty.
           4. Append a final trace entry summarizing the orchestration
-             (which sub-results were merged, total document count).
-          5. Call `publish_result` on the PARENT result ONLY. Never call
-             `publish_result` on a sub-result; sub-results stay as drafts.
+             (sub-results merged, how many were empty, parent document
+             count).
+          5. Call `publish_result` on the PARENT result ONLY, and ONLY
+             after `add_files_to_result` succeeded and the parent has at
+             least one document. Never call `publish_result` on a
+             sub-result, and never publish a parent with zero documents.
           6. After the parent is published, invoke `synthesis-agent`
              passing the user's ORIGINAL question VERBATIM (never rephrase
              or summarize it) and `source_result_id` set to the published
