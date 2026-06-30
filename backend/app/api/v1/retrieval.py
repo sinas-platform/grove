@@ -169,11 +169,25 @@ async def publish_result(
 ):
     from datetime import datetime, timezone
 
-    from app.models import Result
+    from sqlalchemy import func, select
+
+    from app.models import Result, ResultDocument
 
     result = await session.get(Result, result_id)
     if result is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "result not found")
+    doc_count = (
+        await session.execute(
+            select(func.count())
+            .select_from(ResultDocument)
+            .where(ResultDocument.result_id == result_id)
+        )
+    ).scalar_one()
+    if doc_count == 0:
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "cannot publish a result with no documents",
+        )
     result.status = "published"
     result.published_at = datetime.now(timezone.utc)
     await session.commit()
