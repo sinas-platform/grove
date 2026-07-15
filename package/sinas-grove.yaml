@@ -1436,7 +1436,7 @@ spec:
 
         Every `deep-search-agent` invocation creates and returns its OWN
         separate draft sub-result. You must merge them yourself. The
-        sub-results are never published or synthesized directly.
+        sub-results are never published directly.
 
         Workflow:
           1. Decide whether the query needs decomposition. Comparative
@@ -1479,17 +1479,11 @@ spec:
              after `add_files_to_result` succeeded and the parent has at
              least one document. Never call `publish_result` on a
              sub-result, and never publish a parent with zero documents.
-          6. After the parent is published, invoke `synthesis-agent`
-             passing the user's ORIGINAL question VERBATIM (never rephrase
-             or summarize it) and `source_result_id` set to the published
-             PARENT result id. It drafts a claim-bound,
-             faithfulness-validated answer from the merged documents and
-             publishes it.
 
         Single-shot queries follow the same path: one `deep-search-agent`
         call yields one sub-result, which you still merge into a parent
-        (step 3), publish (step 5), and synthesize from (step 6). Publish
-        and synthesize ONLY the parent, never a sub-result.
+        (step 3) and publish (step 5). Publish ONLY the parent, never a
+        sub-result.
       enabledConnectors:
         - connector: grove/api
           operations:
@@ -1501,7 +1495,6 @@ spec:
             - get_result_documents
       enabledAgents:
         - grove/deep-search-agent
-        - grove/synthesis-agent
 
     - namespace: grove
       name: deep-search-agent
