@@ -289,7 +289,14 @@ class GroveFilter(BaseModel):
     document_class_id: uuid.UUID | None = None
     field_filters: list[FieldFilter] = Field(default_factory=list)
     regex_filters: list[RegexFilter] = Field(default_factory=list)
-    text_search: str | None = None
+    text_search: str | None = Field(
+        default=None,
+        description=(
+            "Full-text search in web-search syntax: terms are AND-ed by "
+            "default, `OR` unions terms, `-term` excludes, and \"quoted "
+            "phrases\" match adjacent words."
+        ),
+    )
     dossier_id: uuid.UUID | None = None
     dossier_class_id: uuid.UUID | None = None
     explicit_excludes: list[uuid.UUID] = Field(default_factory=list)

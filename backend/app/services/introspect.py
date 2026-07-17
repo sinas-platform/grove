@@ -132,11 +132,15 @@ def apply_grove_filter(
     if f.text_search:
         from sqlalchemy import text as sql_text
 
+        # websearch_to_tsquery gives callers web-search syntax: terms are
+        # AND-ed by default, `OR` unions, `-term` excludes, and "quoted
+        # phrases" match adjacent words. The query is passed through raw so
+        # the caller decides the semantics; malformed input never raises.
         stmt = stmt.where(
             Document.id.in_(
                 select(sql_text("document_version.document_id"))
                 .select_from(sql_text("document_version"))
-                .where(sql_text("content_tsvector @@ plainto_tsquery(:q)"))
+                .where(sql_text("content_tsvector @@ websearch_to_tsquery(:q)"))
                 .params(q=f.text_search)
             )
         )
