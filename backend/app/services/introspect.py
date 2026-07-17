@@ -19,7 +19,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import literal
 
 from app.auth import CallerIdentity
-from app.models import Document, DocumentClassProperty, PropertyValue
+from app.models import (
+    Document,
+    DocumentClass,
+    DocumentClassProperty,
+    PropertyValue,
+)
 from app.schemas.runtime import (
     FieldFilter,
     GroveFilter,
@@ -179,6 +184,48 @@ async def matching_document_ids(
     stmt = apply_grove_filter(stmt, f)
     stmt = stmt.distinct().order_by(Document.id).limit(limit)
     rows = (await session.execute(stmt)).scalars().all()
+    return list(rows)
+
+
+# How much of the summary to inline per match. The summary is what identifies a
+# document when the filename is a numeric id (most of the corpus), so it has to
+# be long enough to place the document but short enough that a full page of
+# matches doesn't balloon the response the caller re-reads each turn.
+SUMMARY_PREVIEW_CHARS = 240
+
+
+async def matching_document_summaries(
+    session: AsyncSession, caller: CallerIdentity, f: GroveFilter, limit: int
+):
+    """Same match set as `matching_document_ids`, but selecting the fields a
+    caller needs to identify each document without a per-id get_document call:
+    filename, class (id and name), and a summary preview. Ordering and limit
+    match `matching_document_ids` exactly, so the two return the same documents
+    in the same order.
+
+    The class name comes from a left join to `document_class` (a handful of
+    rows, one per document via the FK). content length is deliberately not
+    included: it needs the document_version join and callers don't use it to
+    decide what to attach.
+    """
+    read_all = await caller.has_permission("grove.documents.read:all")
+    stmt = select(
+        Document.id,
+        Document.filename,
+        Document.document_class_id,
+        DocumentClass.name,
+        func.left(Document.summary, SUMMARY_PREVIEW_CHARS),
+    ).where(visible_clause(Document, caller, read_all=read_all))
+    stmt = apply_grove_filter(stmt, f)
+    stmt = (
+        stmt.outerjoin(
+            DocumentClass, DocumentClass.id == Document.document_class_id
+        )
+        .distinct()
+        .order_by(Document.id)
+        .limit(limit)
+    )
+    rows = (await session.execute(stmt)).all()
     return list(rows)
 
 
