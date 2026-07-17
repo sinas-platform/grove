@@ -456,8 +456,11 @@ spec:
             Same filter body as introspect, including web-search syntax in
             `filter.text_search` (AND by default, `OR`, `-term`, "quoted
             phrases"). Returns {document_ids: [...]}, capped by `limit`
-            (default 50, max 200). Use it to pull the actual matches into a
-            draft Result via `add_files_to_result`.
+            (default 50, max 200). When the filter has a `text_search`, ids
+            are ordered most-relevant first, so a truncated response keeps
+            the best matches; without one the order is arbitrary (by id).
+            Use it to pull the actual matches into a draft Result via
+            `add_files_to_result`.
 
         - name: create_draft_result
           method: POST
