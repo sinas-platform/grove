@@ -35,7 +35,13 @@ from app.models import (
     ResultTrace,
 )
 from app.schemas.result_filter import FilterMutationOut
-from app.schemas.runtime import FieldFilter, GroveFilter, IntrospectOut, RegexFilter
+from app.schemas.runtime import (
+    EntityFilter,
+    FieldFilter,
+    GroveFilter,
+    IntrospectOut,
+    RegexFilter,
+)
 from app.services.introspect import count_candidates, introspect_with_filter
 from app.services.visibility import visible_clause
 
@@ -349,6 +355,110 @@ async def remove_field_filter(
         session, caller, result_id, expected_version,
         action="remove_field_filter",
         parameters={"field": field},
+        transform=t,
+    )
+
+
+# ───────────────────────────── entity-filter ops ─────────────────────────────
+
+
+def _without_entity_slot(
+    filters: list[EntityFilter], entity_type_id: uuid.UUID | None
+) -> list[EntityFilter]:
+    return [ef for ef in filters if ef.entity_type_id != entity_type_id]
+
+
+def _find_entity_slot(
+    filters: list[EntityFilter], entity_type_id: uuid.UUID | None
+) -> EntityFilter | None:
+    return next((ef for ef in filters if ef.entity_type_id == entity_type_id), None)
+
+
+async def set_entity_filter(
+    session, caller, result_id, expected_version,
+    entity_type_id: uuid.UUID | None, entity_ids: list[uuid.UUID],
+) -> FilterMutationOut:
+    def t(f: GroveFilter) -> GroveFilter:
+        new_ef = EntityFilter(entity_type_id=entity_type_id, entity_ids=entity_ids)
+        updated = _without_entity_slot(f.entity_filters, entity_type_id) + [new_ef]
+        return f.model_copy(update={"entity_filters": updated})
+
+    return await _mutate_filter(
+        session, caller, result_id, expected_version,
+        action="set_entity_filter",
+        parameters={
+            "entity_type_id": str(entity_type_id) if entity_type_id else None,
+            "entity_ids": [str(x) for x in entity_ids],
+        },
+        transform=t,
+    )
+
+
+async def extend_entity_filter(
+    session, caller, result_id, expected_version,
+    entity_type_id: uuid.UUID | None, entity_ids: list[uuid.UUID],
+) -> FilterMutationOut:
+    def t(f: GroveFilter) -> GroveFilter:
+        existing = _find_entity_slot(f.entity_filters, entity_type_id)
+        if existing is None:
+            new_ef = EntityFilter(entity_type_id=entity_type_id, entity_ids=list(entity_ids))
+        else:
+            merged = list(existing.entity_ids) + [
+                e for e in entity_ids if e not in existing.entity_ids
+            ]
+            new_ef = existing.model_copy(update={"entity_ids": merged})
+        updated = _without_entity_slot(f.entity_filters, entity_type_id) + [new_ef]
+        return f.model_copy(update={"entity_filters": updated})
+
+    return await _mutate_filter(
+        session, caller, result_id, expected_version,
+        action="extend_entity_filter",
+        parameters={
+            "entity_type_id": str(entity_type_id) if entity_type_id else None,
+            "entity_ids": [str(x) for x in entity_ids],
+        },
+        transform=t,
+    )
+
+
+async def shrink_entity_filter(
+    session, caller, result_id, expected_version,
+    entity_type_id: uuid.UUID | None, entity_ids: list[uuid.UUID],
+) -> FilterMutationOut:
+    def t(f: GroveFilter) -> GroveFilter:
+        existing = _find_entity_slot(f.entity_filters, entity_type_id)
+        if existing is None:
+            return f
+        remaining = [e for e in existing.entity_ids if e not in entity_ids]
+        updated = _without_entity_slot(f.entity_filters, entity_type_id)
+        if remaining:
+            updated.append(existing.model_copy(update={"entity_ids": remaining}))
+        return f.model_copy(update={"entity_filters": updated})
+
+    return await _mutate_filter(
+        session, caller, result_id, expected_version,
+        action="shrink_entity_filter",
+        parameters={
+            "entity_type_id": str(entity_type_id) if entity_type_id else None,
+            "entity_ids": [str(x) for x in entity_ids],
+        },
+        transform=t,
+    )
+
+
+async def remove_entity_filter(
+    session, caller, result_id, expected_version,
+    entity_type_id: uuid.UUID | None,
+) -> FilterMutationOut:
+    def t(f: GroveFilter) -> GroveFilter:
+        return f.model_copy(
+            update={"entity_filters": _without_entity_slot(f.entity_filters, entity_type_id)}
+        )
+
+    return await _mutate_filter(
+        session, caller, result_id, expected_version,
+        action="remove_entity_filter",
+        parameters={"entity_type_id": str(entity_type_id) if entity_type_id else None},
         transform=t,
     )
 
@@ -720,6 +830,112 @@ async def clear_result_files(
 
 
 # ───────────────────────────── introspect against persisted filter ─────────────────────────────
+
+
+async def list_candidates_by_result(
+    session: AsyncSession,
+    caller: CallerIdentity,
+    result_id: uuid.UUID,
+    limit: int,
+    offset: int,
+    overlay: GroveFilter | None,
+    order_by: str = "filename",
+    direction: str = "asc",
+    include_toc: bool = False,
+) -> dict[str, Any]:
+    """Return a page of documents matching the result's persisted filter.
+
+    Enumerates what's actually in the candidate set so the agent can inspect
+    individual rows before deciding to `add_files_to_result`. Visibility-scoped
+    via the same `apply_grove_filter` machinery introspect uses.
+
+    Sort options for `order_by`:
+      - "filename" | "created_at" | "updated_at" | "classification_confidence"
+      - "property:<name>" — sort by the document-class property's stored value.
+        Text-cast ordering, which works for ISO dates and exact strings.
+        Documents without a value for the property come last in asc, first
+        in desc (PostgreSQL default NULL ordering).
+
+    Returns a dict `{rows, has_more, next_offset}`. The agent should treat the
+    response as paginated and call again with `next_offset` until `has_more`
+    is false. Total result-set size can be very large; the page limit caps each
+    call so the tool result fits.
+    """
+    from sqlalchemy import asc as sa_asc, desc as sa_desc
+    from app.models import Document, DocumentClassProperty, PropertyValue
+    from app.services.introspect import apply_grove_filter
+    from app.services.visibility import visible_clause
+
+    result = await load_visible_result(session, caller, result_id, for_write=False)
+
+    stored = GroveFilter(**(result.filter or {}))
+    effective = stored if overlay is None else _merge_overlay(stored, overlay)
+    read_all = await caller.has_permission("grove.documents.read:all")
+    cols: list[Any] = [
+        Document.id,
+        Document.filename,
+        Document.summary,
+        Document.document_class_id,
+        Document.classification_confidence,
+    ]
+    if include_toc:
+        cols.append(Document.toc)
+    stmt = select(*cols).where(visible_clause(Document, caller, read_all=read_all))
+    stmt = apply_grove_filter(stmt, effective)
+
+    dir_fn = sa_desc if direction.lower() == "desc" else sa_asc
+    if order_by.startswith("property:"):
+        prop_name = order_by[len("property:"):]
+        if effective.document_class_id is None:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "property-based ordering requires a document_class_id on the filter",
+            )
+        prop_id_subq = (
+            select(DocumentClassProperty.id)
+            .where(DocumentClassProperty.document_class_id == effective.document_class_id)
+            .where(DocumentClassProperty.name == prop_name)
+            .scalar_subquery()
+        )
+        order_value_subq = (
+            select(PropertyValue.value["_"].astext)
+            .where(PropertyValue.document_id == Document.id)
+            .where(PropertyValue.property_id == prop_id_subq)
+            .limit(1)
+            .scalar_subquery()
+        )
+        stmt = stmt.order_by(dir_fn(order_value_subq), Document.filename)
+    elif order_by == "created_at":
+        stmt = stmt.order_by(dir_fn(Document.created_at), Document.filename)
+    elif order_by == "updated_at":
+        stmt = stmt.order_by(dir_fn(Document.updated_at), Document.filename)
+    elif order_by == "classification_confidence":
+        stmt = stmt.order_by(dir_fn(Document.classification_confidence), Document.filename)
+    else:  # "filename" default
+        stmt = stmt.order_by(dir_fn(Document.filename))
+
+    # Fetch limit+1 to know if there's a next page without a separate count.
+    rows = (await session.execute(stmt.limit(limit + 1).offset(offset))).all()
+    has_more = len(rows) > limit
+    rows = rows[:limit]
+
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        entry = {
+            "id": str(r.id),
+            "filename": r.filename,
+            "summary": r.summary,
+            "document_class_id": str(r.document_class_id) if r.document_class_id else None,
+            "classification_confidence": r.classification_confidence,
+        }
+        if include_toc:
+            entry["toc"] = r.toc
+        out.append(entry)
+    return {
+        "rows": out,
+        "has_more": has_more,
+        "next_offset": offset + len(out) if has_more else None,
+    }
 
 
 async def introspect_by_result(

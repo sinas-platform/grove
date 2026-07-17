@@ -23,9 +23,11 @@ from app.models import (
     DocumentClass,
     DocumentClassProperty,
     DocumentVersion,
+    EntityMention,
     PropertyValue,
 )
 from app.schemas.runtime import (
+    EntityFilter,
     FieldFilter,
     GroveFilter,
     IntrospectFieldDistribution,
@@ -164,6 +166,18 @@ def apply_grove_filter(
             clause = _field_filter_exists_clause(ff, f.document_class_id)
             if clause is not None:
                 stmt = stmt.where(clause)
+    if f.entity_filters:
+        for ef in f.entity_filters:
+            if not ef.entity_ids:
+                continue
+            stmt = stmt.where(
+                exists(
+                    select(EntityMention.id).where(
+                        EntityMention.document_id == Document.id,
+                        EntityMention.entity_id.in_(ef.entity_ids),
+                    )
+                )
+            )
     return stmt
 
 

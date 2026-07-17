@@ -24,14 +24,17 @@ from app.schemas.result_filter import (
     ClearIn,
     DocumentIdsIn,
     DocumentMutationOut,
+    EntityFilterValuesIn,
     FieldFilterValuesIn,
     FilterMutationOut,
     IntrospectByResultIn,
+    RemoveEntityFilterIn,
     RemoveFilesIn,
     ReplaceFilterIn,
     SetDocumentClassFilterIn,
     SetDossierClassFilterIn,
     SetDossierFilterIn,
+    SetEntityFilterIn,
     SetFieldFilterIn,
     SetRegexFilterIn,
     SetTextSearchIn,
@@ -168,6 +171,60 @@ async def remove_field_filter(
 ):
     return await svc.remove_field_filter(
         session, caller, result_id, body.filter_version, field
+    )
+
+
+# ───────────────────────────── entity filters ─────────────────────────────
+
+
+@router.post("/filter/entity-filters/set", response_model=FilterMutationOut)
+async def set_entity_filter(
+    result_id: uuid.UUID,
+    body: SetEntityFilterIn,
+    session: AsyncSession = Depends(get_session),
+    caller: CallerIdentity = Depends(get_caller),
+):
+    return await svc.set_entity_filter(
+        session, caller, result_id, body.filter_version,
+        body.entity_type_id, body.entity_ids,
+    )
+
+
+@router.post("/filter/entity-filters/extend", response_model=FilterMutationOut)
+async def extend_entity_filter(
+    result_id: uuid.UUID,
+    body: EntityFilterValuesIn,
+    session: AsyncSession = Depends(get_session),
+    caller: CallerIdentity = Depends(get_caller),
+):
+    return await svc.extend_entity_filter(
+        session, caller, result_id, body.filter_version,
+        body.entity_type_id, body.entity_ids,
+    )
+
+
+@router.post("/filter/entity-filters/shrink", response_model=FilterMutationOut)
+async def shrink_entity_filter(
+    result_id: uuid.UUID,
+    body: EntityFilterValuesIn,
+    session: AsyncSession = Depends(get_session),
+    caller: CallerIdentity = Depends(get_caller),
+):
+    return await svc.shrink_entity_filter(
+        session, caller, result_id, body.filter_version,
+        body.entity_type_id, body.entity_ids,
+    )
+
+
+@router.post("/filter/entity-filters/remove", response_model=FilterMutationOut)
+async def remove_entity_filter(
+    result_id: uuid.UUID,
+    body: RemoveEntityFilterIn,
+    session: AsyncSession = Depends(get_session),
+    caller: CallerIdentity = Depends(get_caller),
+):
+    return await svc.remove_entity_filter(
+        session, caller, result_id, body.filter_version, body.entity_type_id
     )
 
 
@@ -342,6 +399,35 @@ async def introspect_by_result(
     without committing — overlay is NOT persisted."""
     return await svc.introspect_by_result(
         session, caller, result_id, body.fields, body.top_k, body.overlay
+    )
+
+
+@router.get("/candidates")
+async def list_candidates(
+    result_id: uuid.UUID,
+    limit: int = 10,
+    offset: int = 0,
+    order_by: str = "filename",
+    direction: str = "asc",
+    include_toc: bool = False,
+    session: AsyncSession = Depends(get_session),
+    caller: CallerIdentity = Depends(get_caller),
+):
+    """Page through documents matching the result's persisted filter.
+
+    Lets the agent look at the actual candidates (filename, summary, optional
+    ToC, class) before deciding what to `add_files_to_result`. Visibility-scoped.
+    Response is `{rows, has_more, next_offset}`; call again with `next_offset`
+    while `has_more`.
+
+    Order_by: `filename` | `created_at` | `updated_at` |
+    `classification_confidence` | `property:<name>`. Default 10/page;
+    keep responses tool-call-result friendly.
+    """
+    return await svc.list_candidates_by_result(
+        session, caller, result_id,
+        limit=limit, offset=offset, overlay=None,
+        order_by=order_by, direction=direction, include_toc=include_toc,
     )
 
 

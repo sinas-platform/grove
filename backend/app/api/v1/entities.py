@@ -52,6 +52,62 @@ async def list_entities(
     return (await session.execute(stmt)).scalars().all()
 
 
+class EntityDocumentRow(BaseModel):
+    id: uuid.UUID
+    filename: str
+    summary: str | None = None
+    document_class_id: uuid.UUID | None = None
+    mention_count: int
+
+
+@router.get("/{entity_id}/documents", response_model=list[EntityDocumentRow])
+async def list_documents_by_entity(
+    entity_id: uuid.UUID,
+    limit: int = 25,
+    offset: int = 0,
+    session: AsyncSession = Depends(get_session),
+    caller: CallerIdentity = Depends(get_caller),
+):
+    """List documents that mention `entity_id`. Visibility-scoped.
+
+    Returns one row per document with the count of mentions of this entity
+    in that document. Pagination is offset-based.
+    """
+    from sqlalchemy import func as sa_func
+
+    from app.models import Document, EntityMention
+    from app.services.visibility import visible_clause
+
+    read_all = await caller.has_permission("grove.documents.read:all")
+    stmt = (
+        select(
+            Document.id,
+            Document.filename,
+            Document.summary,
+            Document.document_class_id,
+            sa_func.count(EntityMention.id).label("mention_count"),
+        )
+        .join(EntityMention, EntityMention.document_id == Document.id)
+        .where(EntityMention.entity_id == entity_id)
+        .where(visible_clause(Document, caller, read_all=read_all))
+        .group_by(Document.id)
+        .order_by(sa_func.count(EntityMention.id).desc(), Document.filename)
+        .limit(limit)
+        .offset(offset)
+    )
+    rows = (await session.execute(stmt)).all()
+    return [
+        EntityDocumentRow(
+            id=r.id,
+            filename=r.filename,
+            summary=r.summary,
+            document_class_id=r.document_class_id,
+            mention_count=int(r.mention_count),
+        )
+        for r in rows
+    ]
+
+
 @router.get("/proposals", response_model=list[EntityProposalOut])
 async def list_entity_proposals(
     status_filter: str = "pending",

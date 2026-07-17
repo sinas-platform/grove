@@ -299,10 +299,24 @@ class RegexFilter(BaseModel):
     pattern: str
 
 
+class EntityFilter(BaseModel):
+    """Document must have an EntityMention to one of `entity_ids`.
+
+    Slot keying: `entity_type_id` is the slot key — there is at most one
+    EntityFilter per entity_type_id, and `None` is a valid slot for ungrouped
+    use. Multiple EntityFilters (different slots) AND together; within a slot,
+    `entity_ids` are OR'd. Mirrors FieldFilter's per-field convention.
+    """
+
+    entity_type_id: uuid.UUID | None = None
+    entity_ids: list[uuid.UUID] = Field(default_factory=list)
+
+
 class GroveFilter(BaseModel):
     document_class_id: uuid.UUID | None = None
     field_filters: list[FieldFilter] = Field(default_factory=list)
     regex_filters: list[RegexFilter] = Field(default_factory=list)
+    entity_filters: list[EntityFilter] = Field(default_factory=list)
     text_search: str | None = Field(
         default=None,
         description=(

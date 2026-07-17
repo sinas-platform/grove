@@ -171,6 +171,151 @@ spec:
             Fetch a playbook's full content. Use after `list_applicable_playbooks`
             has surfaced what's available for the current scope.
 
+        # ── candidate inspection ──
+        - name: list_candidates
+          method: GET
+          path: /api/v1/retrieval/results/{{ result_id }}/candidates
+          parameters:
+            type: object
+            properties:
+              result_id: { type: string, format: uuid }
+              limit: { type: integer, minimum: 1, maximum: 50 }
+              offset: { type: integer, minimum: 0 }
+              order_by:
+                type: string
+                description: |
+                  filename | created_at | updated_at |
+                  classification_confidence | property:<name>
+              direction: { type: string, enum: [asc, desc] }
+              include_toc: { type: boolean }
+            required: [result_id]
+          description: |
+            Page through documents currently matching the result's persisted
+            filter. ALWAYS check summaries (and optionally ToC) here BEFORE
+            calling `read_document_content` — reading bodies is much more
+            expensive, and the summary is usually enough to judge relevance.
+
+            Response: `{rows, has_more, next_offset}` where each row is
+            `{id, filename, summary, document_class_id,
+            classification_confidence, (toc if include_toc)}`.
+            If `has_more` is true, call again with `offset=next_offset`.
+            Default limit is 10 — keep it small; tool result size matters.
+
+            Sorting: `order_by=property:decision_date direction=desc` gives
+            latest-first, important for citation/supersession chains.
+
+        # ── entities: list/search globally, find docs by entity ──
+        - name: list_entities
+          method: GET
+          path: /api/v1/entities
+          parameters:
+            type: object
+            properties:
+              entity_type_id: { type: string, format: uuid }
+              q:
+                type: string
+                description: case-insensitive substring on canonical_form
+              limit: { type: integer, minimum: 1, maximum: 500 }
+          description: |
+            Search entities globally. Use when the question names an entity
+            (e.g. "Autorité de la concurrence") to resolve the name to one or
+            more candidate `entity_id`s. Then call
+            `list_documents_by_entity(entity_id)` to find documents that
+            mention it, or use the entity-filter mutations to narrow the
+            result's filter directly.
+
+        - name: list_documents_by_entity
+          method: GET
+          path: /api/v1/entities/{{ entity_id }}/documents
+          parameters:
+            type: object
+            properties:
+              entity_id: { type: string, format: uuid }
+              limit: { type: integer, minimum: 1, maximum: 100 }
+              offset: { type: integer, minimum: 0 }
+            required: [entity_id]
+          description: |
+            List documents that mention `entity_id`, with mention counts.
+            Visibility-scoped. Sorted by mention_count desc. Use for the
+            graph-traversal "what docs reference this thing" lookup before
+            filtering or pinning.
+
+        - name: get_entity_mentions_for_document
+          method: GET
+          path: /api/v1/documents/{{ doc_id }}/entity-mentions
+          parameters:
+            type: object
+            properties:
+              doc_id: { type: string, format: uuid }
+            required: [doc_id]
+          description: |
+            List all entities mentioned in a document with their spans. Use
+            when judging whether a candidate is relevant: which entities does
+            it actually reference?
+
+        # ── entity-filter mutations (server-traced) ──
+        - name: set_entity_filter
+          method: POST
+          path: /api/v1/retrieval/results/{{ result_id }}/filter/entity-filters/set
+          parameters:
+            type: object
+            properties:
+              result_id: { type: string, format: uuid }
+              filter_version: { type: integer }
+              entity_type_id: { type: string, format: uuid }
+              entity_ids:
+                type: array
+                items: { type: string, format: uuid }
+            required: [result_id, filter_version, entity_ids]
+          description: |
+            Narrow the result's candidate set to documents that mention at
+            least one of `entity_ids`. `entity_type_id` is the slot key
+            (omit for ungrouped); multiple slots AND together, so calling
+            this twice with different entity_type_ids gives
+            "mentions Authority X AND mentions Article Y".
+
+        - name: extend_entity_filter
+          method: POST
+          path: /api/v1/retrieval/results/{{ result_id }}/filter/entity-filters/extend
+          parameters:
+            type: object
+            properties:
+              result_id: { type: string, format: uuid }
+              filter_version: { type: integer }
+              entity_type_id: { type: string, format: uuid }
+              entity_ids:
+                type: array
+                items: { type: string, format: uuid }
+            required: [result_id, filter_version, entity_ids]
+          description: Add entity_ids to the slot's OR list (widens within-slot).
+
+        - name: shrink_entity_filter
+          method: POST
+          path: /api/v1/retrieval/results/{{ result_id }}/filter/entity-filters/shrink
+          parameters:
+            type: object
+            properties:
+              result_id: { type: string, format: uuid }
+              filter_version: { type: integer }
+              entity_type_id: { type: string, format: uuid }
+              entity_ids:
+                type: array
+                items: { type: string, format: uuid }
+            required: [result_id, filter_version, entity_ids]
+          description: Remove entity_ids from the slot's OR list.
+
+        - name: remove_entity_filter
+          method: POST
+          path: /api/v1/retrieval/results/{{ result_id }}/filter/entity-filters/remove
+          parameters:
+            type: object
+            properties:
+              result_id: { type: string, format: uuid }
+              filter_version: { type: integer }
+              entity_type_id: { type: string, format: uuid }
+            required: [result_id, filter_version]
+          description: Drop the entire slot.
+
         - name: get_dossier_classes
           method: GET
           path: /api/v1/config/dossier-classes
@@ -1611,6 +1756,14 @@ spec:
         Loop:
           1. Call `create_draft_result` with the query. You receive
              `result_id` and `filter_version=0`.
+          1.5. One-time orientation: call `get_document_classes` (and
+             `get_dossier_classes` if dossiers are configured) to see
+             what kinds of documents exist. Pick a class that matches
+             the question's domain and call `set_document_class_filter`
+             before introspecting — `introspect_by_result` returns
+             empty distributions until a class is set. If you need
+             property names for that class, call
+             `get_document_class_properties(class_id)`.
           2. Call `introspect_by_result(result_id)`. On the FIRST call
              leave `fields` unset to see every property's distribution
              and learn which fields discriminate; on every later call
@@ -1651,19 +1804,31 @@ spec:
           5. Repeat 2–4 until either the candidate set matches your
              playbook's stop conditions, or introspect shows no further
              filter discriminates the set meaningfully.
-          6. After narrowing the candidates with introspect, call
-             `matching_documents` to see WHICH documents the filter
-             selected (introspect only returns counts and
-             distributions). Each match already includes its filename,
-             class, and a summary preview — that is your triage
-             information. Do NOT call `get_document` per returned id
-             just to find out what it is; reserve `get_document` and
-             `read_document_content` for the few documents whose
-             detail you genuinely need before deciding.
-          7. Call `add_files_to_result` with the matched document IDs
-             to include them in the Result (also pull any you staged
-             via explicit_includes — `get_result_documents` shows
-             what's already attached).
+          6. Inspect candidates — SUMMARY-FIRST READING.
+             - Call `list_candidates(result_id, limit=10)` to see
+               filenames + summaries. The response is paginated
+               (`has_more`, `next_offset`) — only page further if you
+               actually need to. Tool-call results have size limits,
+               so keep limits small.
+             - If summaries aren't enough to judge, call again with
+               `include_toc=true` for the table of contents — still
+               much cheaper than the body.
+             - Only call `read_document_content` for the specific
+               docs whose summary + ToC look promising but ambiguous.
+               Reading every body is the wrong default, and never call
+               `get_document` per id just to find out what it is —
+               the listing already carries that.
+             - For citation / supersession reasoning, sort by date so
+               the latest comes first: `order_by=property:decision_date
+               direction=desc`. Recent rulings often supersede older
+               ones — read in that order and stop once you have what
+               you need.
+             - Use what you find here to mutate the filter further
+               (excludes for obviously irrelevant docs, includes for
+               must-keep ones) or to declare the set good enough.
+          7. Call `add_files_to_result` with the surviving candidates
+             (use `get_result_documents` if you've staged inclusions via
+             explicit_includes already).
           8. Invoke `process-validation-agent` to check the draft
              against the playbook criteria. Pass it the result_id AND
              the EXACT name of the playbook you loaded in your first
@@ -1681,9 +1846,29 @@ spec:
              additional relationships that might inform the user (the
              discovery agent only writes proposals, never facts).
 
-        Never publish a Result without first retrieving the document IDs
-        via `matching_documents` and adding them with `add_files_to_result`
-        — a Result with a filter but no attached documents is empty.
+        Entity-based discovery — when the question names a thing
+        (a court, an authority, a company, a legal article):
+          a. `list_entities(entity_type_id=…, q="<name>")` to resolve
+             the name to candidate `entity_id`s. Match the most likely.
+          b. Either narrow the filter to docs that mention it via
+             `set_entity_filter(entity_type_id, [entity_id])`, or, if
+             you want every mention pinned regardless of other filters,
+             use `list_documents_by_entity(entity_id)` followed by
+             `add_explicit_includes(those_ids)`. Filter is usually
+             cleaner; explicit_includes is for the "must include these
+             specific docs no matter what" case.
+          c. For multi-entity questions ("involving Authority A AND
+             Article 101"), call `set_entity_filter` once per
+             `entity_type_id` slot — slots AND together.
+          d. To follow citation chains: for each surviving doc, call
+             `get_relationships(source_id=doc_id,
+             relationship_definition_id=<cites>)` → collect target_ids
+             → `add_explicit_includes(target_ids)`.
+
+        Never publish a Result without attached documents — inspect the
+        candidates (`list_candidates` / `matching_documents`) and add
+        them with `add_files_to_result`; a Result with a filter but no
+        attached documents is empty.
 
         Probe before commit: if you want to know "what would happen if I
         added jurisdiction=FR?" without committing the change, pass an
@@ -1710,15 +1895,28 @@ spec:
       enabledConnectors:
         - connector: grove/api
           operations:
-            # introspect + result lifecycle
+            # config discovery
+            - get_document_classes
+            - get_document_class_properties
+            - get_dossier_classes
+            - get_dossier_class_properties
+            - get_entity_types
+            - get_entity_types_for_class
+            - get_relationship_definitions
+            # entity & graph traversal
+            - list_entities
+            - list_documents_by_entity
+            - get_entity_mentions_for_document
+            - get_relationships
+            # introspect + candidate inspection
             - introspect
             - introspect_by_result
             - matching_documents
+            - list_candidates
             - get_document
             - get_property_values
             - read_document_content
-            - get_relationships
-            - get_relationship_definitions
+            # result lifecycle
             - create_draft_result
             - add_files_to_result
             - remove_files_from_result
@@ -1737,6 +1935,10 @@ spec:
             - extend_field_filter_values
             - shrink_field_filter_values
             - remove_field_filter
+            - set_entity_filter
+            - extend_entity_filter
+            - shrink_entity_filter
+            - remove_entity_filter
             - set_regex_filter
             - remove_regex_filter
             - set_text_search
