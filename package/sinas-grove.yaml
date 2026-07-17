@@ -1553,6 +1553,7 @@ spec:
             - get_property_values
             - read_document_content
             - get_relationships
+            - get_relationship_definitions
             - create_draft_result
             - add_files_to_result
             - remove_files_from_result
