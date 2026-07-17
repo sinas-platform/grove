@@ -11,6 +11,7 @@ distribution. See the stateful-filter ADR for the design discussion.
 
 from __future__ import annotations
 
+import uuid
 from typing import Any
 
 from sqlalchemy import and_, exists, func, or_, select
@@ -159,6 +160,26 @@ async def count_candidates(
         await session.execute(select(func.count()).select_from(base.subquery()))
     ).scalar_one()
     return int(total)
+
+
+async def matching_document_ids(
+    session: AsyncSession, caller: CallerIdentity, f: GroveFilter, limit: int
+) -> list[uuid.UUID]:
+    """Return the document ids matching the filter (instead of a count).
+
+    Same selection logic as `count_candidates` — visibility scope plus
+    `apply_grove_filter` — but enumerates the matches so the caller can pull
+    them into a Result. `DISTINCT` guards against row fan-out if a future
+    clause joins; ordered by id for stable truncation under `limit`.
+    """
+    read_all = await caller.has_permission("grove.documents.read:all")
+    stmt = select(Document.id).where(
+        visible_clause(Document, caller, read_all=read_all)
+    )
+    stmt = apply_grove_filter(stmt, f)
+    stmt = stmt.distinct().order_by(Document.id).limit(limit)
+    rows = (await session.execute(stmt)).scalars().all()
+    return list(rows)
 
 
 async def introspect_with_filter(
