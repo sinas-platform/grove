@@ -14,7 +14,7 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
-from sqlalchemy import and_, exists, func, or_, select
+from sqlalchemy import and_, exists, func, literal_column, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import literal
 
@@ -136,11 +136,19 @@ def apply_grove_filter(
         # AND-ed by default, `OR` unions, `-term` excludes, and "quoted
         # phrases" match adjacent words. The query is passed through raw so
         # the caller decides the semantics; malformed input never raises.
+        #
+        # The regconfig MUST be 'simple', matching the trigger that builds
+        # content_tsvector (0001_baseline). Relying on the session default
+        # ('english' in practice) stems query terms — dominance→domin,
+        # competition→competit — which can never match the unstemmed lexemes
+        # in a 'simple' index, silently zeroing most matches.
         stmt = stmt.where(
             Document.id.in_(
                 select(sql_text("document_version.document_id"))
                 .select_from(sql_text("document_version"))
-                .where(sql_text("content_tsvector @@ websearch_to_tsquery(:q)"))
+                .where(
+                    sql_text("content_tsvector @@ websearch_to_tsquery('simple', :q)")
+                )
                 .params(q=f.text_search)
             )
         )
@@ -189,7 +197,12 @@ async def matching_document_ids(
     )
     stmt = apply_grove_filter(stmt, f)
     if f.text_search:
-        tsquery = func.websearch_to_tsquery(f.text_search)
+        # 'simple' pinned to match the index build — see apply_grove_filter.
+        # literal_column keeps it an unquoted-literal regconfig rather than a
+        # text bind param, which asyncpg would fail to resolve to a regconfig.
+        tsquery = func.websearch_to_tsquery(
+            literal_column("'simple'"), f.text_search
+        )
         rank = func.max(func.ts_rank(DocumentVersion.content_tsvector, tsquery))
         stmt = (
             stmt.join(
