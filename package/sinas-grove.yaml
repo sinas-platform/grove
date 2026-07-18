@@ -9,7 +9,7 @@ metadata:
 
 package:
   name: sinas-grove
-  version: "0.1.14"
+  version: "0.1.15"
   description: >
     Sinas Grove — stateful, multi-agent document indexing and retrieval. The
     runtime is generic; domain knowledge (document classes, properties,
@@ -845,6 +845,18 @@ spec:
               result_id: { type: string, format: uuid }
             required: [result_id]
 
+        - name: list_results
+          method: GET
+          path: /api/v1/results
+          parameters:
+            type: object
+            properties:
+              limit: { type: integer, default: 20 }
+          description: |
+            Recent results, newest first (query, status, id). Use it to check
+            whether a result for a given sub-query already exists — e.g.
+            before re-dispatching a sub-search whose invocation timed out.
+
         - name: get_result
           method: GET
           path: /api/v1/results/{{ result_id }}
@@ -1529,6 +1541,14 @@ spec:
           2. For each (sub)query, invoke `deep-search-agent`. Each
              invocation runs the introspect-filter-validate loop and
              produces a draft result.
+             If an invocation TIMES OUT, do not immediately re-dispatch:
+             the sub-agent is usually still working. Call `list_results`
+             and check for a recent result matching that sub-query —
+             if one exists (draft or published), use it; if not, wait by
+             checking `list_results` again after doing other pending
+             work. Only re-dispatch a sub-search when there is no
+             matching result at all. Duplicate sub-searches are the
+             single most expensive failure mode.
           3. After all sub-searches complete, merge their results into a
              single parent result. Persist the parent's
              `parent_result_id` linkage.
@@ -1545,6 +1565,7 @@ spec:
             - append_trace
             - publish_result
             - get_result
+            - list_results
       enabledAgents:
         - grove/deep-search-agent
 
@@ -1648,6 +1669,16 @@ spec:
         `overlay` to `introspect_by_result` — it's read-only and not
         persisted.
 
+        Work economically — every turn re-sends your whole conversation:
+          - BATCH independent tool calls in a single turn. Reading four
+            candidate documents is ONE turn with four parallel
+            `read_document_content` calls, not four turns.
+          - Read with a target. `get_document` returns a `toc`; use it
+            to pick the section you need and fetch that window with
+            `line_from`/`line_to` instead of paging from line 1. Most
+            relevance checks need one targeted window, not the whole
+            document.
+
         Before starting the loop: call `list_applicable_playbooks(kind=retrieval,
         document_class_id=…, dossier_class_id=…)` to see which retrieval
         playbooks apply, then `get_playbook` to fetch the bodies of any that
@@ -1727,12 +1758,21 @@ spec:
              `inconclusive: playbook not found — <what you tried>`.
              Do not keep retrying.
           3. Call `get_result` and `get_result_documents` to inspect the
-             draft.
+             draft. Each attached document already carries its filename,
+             class, and a summary preview — that is usually enough to
+             judge coverage-type criteria. Do NOT call `get_document`
+             per row. Read full content only when a checklist item
+             genuinely requires verifying text, and BATCH those reads:
+             several parallel `read_document_content` calls in one turn,
+             not one read per turn.
           4. For each item on the playbook's checklist, judge: pass /
              fail / cannot-determine. Be strict — false passes are worse
              than false fails.
-          5. Reply with a verdict (`pass`, `fail`, `inconclusive`) and a
-             short reasoning per checklist item.
+          5. Reply with the overall verdict (`pass`, `fail`,
+             `inconclusive`) followed by ONE LINE per checklist item:
+             `<item>: pass|fail|cannot-determine — <reason, one clause>`.
+             No prose beyond that; the caller only acts on the verdict
+             lines.
 
         Do not modify the result yourself — your only output is the
         verdict.
@@ -1809,6 +1849,9 @@ spec:
              you will actually draw claims from — you need the exact
              span (line_from/line_to) of every piece of evidence you
              bind, and spans come from reading, never from summaries.
+             BATCH those reads: several parallel `read_document_content`
+             calls in one turn, and use each document's `toc` to fetch
+             the relevant window instead of paging from line 1.
           5. Draft claims one by one, each WITH its evidence:
                a. Call `draft_claim` with the claim's text, type, and
                   the supporting spans in `evidence` — one call per
@@ -2039,7 +2082,8 @@ spec:
               a. Read the cited span via `read_document_content` (use the
                  span's line_from/line_to). Spans in the same document can
                  share one read: fetch a window covering them and judge
-                 each against it.
+                 each against it. Batch reads for different documents as
+                 parallel calls in one turn.
               b. Judge whether the span supports the claim with the
                  declared stance. Note the verdict; don't record it yet.
           4. Record all verdicts in ONE `record_validation_verdicts` call
