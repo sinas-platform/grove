@@ -11,10 +11,9 @@ distribution. See the stateful-filter ADR for the design discussion.
 
 from __future__ import annotations
 
-import uuid
 from typing import Any
 
-from sqlalchemy import and_, exists, func, or_, select
+from sqlalchemy import and_, exists, func, literal_column, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import literal
 
@@ -23,6 +22,7 @@ from app.models import (
     Document,
     DocumentClass,
     DocumentClassProperty,
+    DocumentVersion,
     PropertyValue,
 )
 from app.schemas.runtime import (
@@ -137,11 +137,23 @@ def apply_grove_filter(
     if f.text_search:
         from sqlalchemy import text as sql_text
 
+        # websearch_to_tsquery gives callers web-search syntax: terms are
+        # AND-ed by default, `OR` unions, `-term` excludes, and "quoted
+        # phrases" match adjacent words. The query is passed through raw so
+        # the caller decides the semantics; malformed input never raises.
+        #
+        # The regconfig MUST be 'simple', matching the trigger that builds
+        # content_tsvector (0001_baseline). Relying on the session default
+        # ('english' in practice) stems query terms — dominance→domin,
+        # competition→competit — which can never match the unstemmed lexemes
+        # in a 'simple' index, silently zeroing most matches.
         stmt = stmt.where(
             Document.id.in_(
                 select(sql_text("document_version.document_id"))
                 .select_from(sql_text("document_version"))
-                .where(sql_text("content_tsvector @@ plainto_tsquery(:q)"))
+                .where(
+                    sql_text("content_tsvector @@ websearch_to_tsquery('simple', :q)")
+                )
                 .params(q=f.text_search)
             )
         )
@@ -167,26 +179,6 @@ async def count_candidates(
     return int(total)
 
 
-async def matching_document_ids(
-    session: AsyncSession, caller: CallerIdentity, f: GroveFilter, limit: int
-) -> list[uuid.UUID]:
-    """Return the document ids matching the filter (instead of a count).
-
-    Same selection logic as `count_candidates` — visibility scope plus
-    `apply_grove_filter` — but enumerates the matches so the caller can pull
-    them into a Result. `DISTINCT` guards against row fan-out if a future
-    clause joins; ordered by id for stable truncation under `limit`.
-    """
-    read_all = await caller.has_permission("grove.documents.read:all")
-    stmt = select(Document.id).where(
-        visible_clause(Document, caller, read_all=read_all)
-    )
-    stmt = apply_grove_filter(stmt, f)
-    stmt = stmt.distinct().order_by(Document.id).limit(limit)
-    rows = (await session.execute(stmt)).scalars().all()
-    return list(rows)
-
-
 # How much of the summary to inline per match. The summary is what identifies a
 # document when the filename is a numeric id (most of the corpus), so it has to
 # be long enough to place the document but short enough that a full page of
@@ -197,34 +189,59 @@ SUMMARY_PREVIEW_CHARS = 240
 async def matching_document_summaries(
     session: AsyncSession, caller: CallerIdentity, f: GroveFilter, limit: int
 ):
-    """Same match set as `matching_document_ids`, but selecting the fields a
-    caller needs to identify each document without a per-id get_document call:
-    filename, class (id and name), and a summary preview. Ordering and limit
-    match `matching_document_ids` exactly, so the two return the same documents
-    in the same order.
+    """Enumerate the documents matching the filter (instead of a count).
 
-    The class name comes from a left join to `document_class` (a handful of
-    rows, one per document via the FK). content length is deliberately not
-    included: it needs the document_version join and callers don't use it to
-    decide what to attach.
+    Same selection logic as `count_candidates` — visibility scope plus
+    `apply_grove_filter` — but returns, per match, the fields a caller needs
+    to identify each document without a per-id get_document call: filename,
+    class (id and name), and a summary preview. The class name comes from a
+    left join to `document_class` (nullable FK — an inner join would drop
+    unclassified documents).
+
+    With a text search active, results are ordered by FTS relevance so the
+    top `limit` are the best matches; otherwise by id for stable truncation.
+    Relevance ranks the same rows the filter matched on: every version whose
+    tsvector satisfies the query, aggregated per document with MAX. Ranking
+    only the current version would score documents on text the filter never
+    matched, and an inner join on `current_version_id` (nullable) would drop
+    matched documents outright.
     """
     read_all = await caller.has_permission("grove.documents.read:all")
-    stmt = select(
+    cols = (
         Document.id,
         Document.filename,
         Document.document_class_id,
         DocumentClass.name,
         func.left(Document.summary, SUMMARY_PREVIEW_CHARS),
-    ).where(visible_clause(Document, caller, read_all=read_all))
-    stmt = apply_grove_filter(stmt, f)
-    stmt = (
-        stmt.outerjoin(
-            DocumentClass, DocumentClass.id == Document.document_class_id
-        )
-        .distinct()
-        .order_by(Document.id)
-        .limit(limit)
     )
+    stmt = (
+        select(*cols)
+        .where(visible_clause(Document, caller, read_all=read_all))
+        .outerjoin(DocumentClass, DocumentClass.id == Document.document_class_id)
+    )
+    stmt = apply_grove_filter(stmt, f)
+    if f.text_search:
+        # 'simple' pinned to match the index build — see apply_grove_filter.
+        # literal_column keeps it an unquoted-literal regconfig rather than a
+        # text bind param, which asyncpg would fail to resolve to a regconfig.
+        tsquery = func.websearch_to_tsquery(
+            literal_column("'simple'"), f.text_search
+        )
+        rank = func.max(func.ts_rank(DocumentVersion.content_tsvector, tsquery))
+        stmt = (
+            stmt.join(
+                DocumentVersion,
+                and_(
+                    DocumentVersion.document_id == Document.id,
+                    DocumentVersion.content_tsvector.op("@@")(tsquery),
+                ),
+            )
+            .group_by(*cols)
+            .order_by(rank.desc(), Document.id)
+            .limit(limit)
+        )
+    else:
+        stmt = stmt.distinct().order_by(Document.id).limit(limit)
     rows = (await session.execute(stmt)).all()
     return list(rows)
 

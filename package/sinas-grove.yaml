@@ -435,6 +435,12 @@ spec:
                 type: array
                 items: { type: string }
               top_k: { type: integer }
+          description: |
+            Count the documents matching the filter and return faceted value
+            distributions for the requested fields. `filter.text_search` uses
+            web-search syntax: terms are AND-ed by default, `OR` unions terms,
+            `-term` excludes, and "quoted phrases" match adjacent words —
+            e.g. `"climate adaptation" OR flood -insurance`.
 
         - name: matching_documents
           method: POST
@@ -445,11 +451,21 @@ spec:
               filter: { type: object }
               limit: { type: integer, default: 50 }
           description: |
-            Enumerate the document ids matching the filter — the companion to
+            Enumerate the documents matching the filter — the companion to
             `introspect`, which only returns counts and value distributions.
-            Same filter body as introspect. Returns {document_ids: [...]},
-            capped by `limit` (default 50, max 200). Use it to pull the actual
-            matches into a draft Result via `add_files_to_result`.
+            Same filter body as introspect, including web-search syntax in
+            `filter.text_search` (AND by default, `OR`, `-term`, "quoted
+            phrases"). Returns {document_ids: [...], documents: [...]} where
+            each documents entry carries `id`, `filename`,
+            `document_class_name`, and a `summary` preview — enough to tell
+            what every match is WITHOUT calling `get_document` per id. Only
+            call `get_document`/`read_document_content` on the few documents
+            you actually need to inspect further. Capped by `limit` (default
+            50, max 200). When the filter has a `text_search`, matches are
+            ordered most-relevant first, so a truncated response keeps the
+            best matches; without one the order is arbitrary (by id). Use it
+            to pull the actual matches into a draft Result via
+            `add_files_to_result`.
 
         - name: create_draft_result
           method: POST
@@ -682,7 +698,11 @@ spec:
               filter_version: { type: integer }
               query: { type: string }
             required: [result_id, filter_version, query]
-          description: Set the full-text-search query on this filter.
+          description: |
+            Set the full-text-search query on this filter. The query uses
+            web-search syntax: terms are AND-ed by default, `OR` unions
+            terms, `-term` excludes, and "quoted phrases" match adjacent
+            words — e.g. `"supply chain" OR logistics -aviation`.
 
         - name: clear_text_search
           method: POST
@@ -1499,7 +1519,12 @@ spec:
                - `set_field_filter` / `extend_field_filter_values` /
                  `shrink_field_filter_values` / `remove_field_filter`
                  for property filters
-               - `set_text_search` / `clear_text_search` for FTS
+               - `set_text_search` / `clear_text_search` for FTS.
+                 Text queries take web-search syntax: terms AND by
+                 default, `OR` to union, `-term` to exclude, "quoted
+                 phrases" for adjacency. Start strict (AND, phrases)
+                 and widen with `OR` if the candidate count drops too
+                 low — introspect after each change shows the effect.
                - `add_explicit_includes` / `add_explicit_excludes` for
                  pin/block
                - `clear_filter` / `replace_filter` for resets
@@ -1512,13 +1537,18 @@ spec:
              playbook's stop conditions, or introspect shows no further
              filter discriminates the set meaningfully.
           6. After narrowing the candidates with introspect, call
-             `matching_documents` to get the actual document IDs.
-             Introspect only returns counts and distributions, so this
-             is the only way to learn WHICH documents the filter selected.
-          7. Call `add_files_to_result` with those document IDs to include
-             them in the Result (also pull any you staged via
-             explicit_includes — `get_result_documents` shows what's
-             already attached).
+             `matching_documents` to see WHICH documents the filter
+             selected (introspect only returns counts and
+             distributions). Each match already includes its filename,
+             class, and a summary preview — that is your triage
+             information. Do NOT call `get_document` per returned id
+             just to find out what it is; reserve `get_document` and
+             `read_document_content` for the few documents whose
+             detail you genuinely need before deciding.
+          7. Call `add_files_to_result` with the matched document IDs
+             to include them in the Result (also pull any you staged
+             via explicit_includes — `get_result_documents` shows
+             what's already attached).
           8. Invoke `process-validation-agent` to check the draft
              against the playbook criteria. If it passes, return. If
              not, mutate the filter and retry.
