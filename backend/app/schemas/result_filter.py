@@ -106,7 +106,8 @@ class IntrospectByResultIn(BaseModel):
     (preview semantics) — overlay is *not* persisted."""
 
     fields: list[str] | None = None
-    top_k: int = 25
+    # Same default as IntrospectIn.top_k — see the rationale there.
+    top_k: int = Field(default=10, ge=1, le=100)
     overlay: GroveFilter | None = None
 
 

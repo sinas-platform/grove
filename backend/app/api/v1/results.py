@@ -5,12 +5,13 @@ from __future__ import annotations
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import CallerIdentity, get_caller
 from app.db import get_session
-from app.models import Result, ResultDocument, ResultTrace
+from app.models import Document, DocumentClass, Result, ResultDocument, ResultTrace
+from app.services.introspect import SUMMARY_PREVIEW_CHARS
 from app.schemas.common import TraceOut
 from app.schemas.runtime import ResultDocumentOut, ResultOut
 from app.services.visibility import visible_clause
@@ -58,14 +59,34 @@ async def get_result(
 async def get_result_documents(
     result_id: uuid.UUID, session: AsyncSession = Depends(get_session)
 ):
+    """Attached documents with identifying fields joined in (filename, class
+    name, summary preview), so a reader doesn't need a get_document call per
+    row to learn what each attachment is."""
     rows = (
         await session.execute(
-            select(ResultDocument)
+            select(
+                ResultDocument,
+                Document.filename,
+                DocumentClass.name,
+                func.left(Document.summary, SUMMARY_PREVIEW_CHARS),
+            )
+            .join(Document, Document.id == ResultDocument.document_id)
+            .outerjoin(DocumentClass, DocumentClass.id == Document.document_class_id)
             .where(ResultDocument.result_id == result_id)
             .order_by(ResultDocument.rank.nulls_last())
         )
-    ).scalars().all()
-    return rows
+    ).all()
+    return [
+        ResultDocumentOut(
+            **ResultDocumentOut.model_validate(rd).model_dump(
+                exclude={"filename", "document_class_name", "summary"}
+            ),
+            filename=filename,
+            document_class_name=class_name,
+            summary=summary,
+        )
+        for rd, filename, class_name, summary in rows
+    ]
 
 
 @router.get("/{result_id}/trace", response_model=list[TraceOut])
