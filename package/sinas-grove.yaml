@@ -441,6 +441,12 @@ spec:
             web-search syntax: terms are AND-ed by default, `OR` unions terms,
             `-term` excludes, and "quoted phrases" match adjacent words —
             e.g. `"climate adaptation" OR flood -insurance`.
+            With `fields` omitted, distributions cover EVERY property of the
+            class — do that at most once, to learn which fields discriminate.
+            On every later call pass `fields` with only the properties you
+            are still deciding on: the response is smaller, faster, and you
+            re-read it each turn. `top_k` (default 10) caps values per field;
+            raise it only when you genuinely need the long tail.
 
         - name: matching_documents
           method: POST
@@ -535,7 +541,7 @@ spec:
               fields:
                 type: array
                 items: { type: string }
-              top_k: { type: integer, default: 25 }
+              top_k: { type: integer, default: 10 }
               overlay:
                 type: object
                 description: Optional ephemeral filter overlay for what-if probes; not persisted.
@@ -856,6 +862,13 @@ spec:
             properties:
               result_id: { type: string, format: uuid }
             required: [result_id]
+          description: |
+            The documents attached to a result, in rank order. Each row
+            already carries `filename`, `document_class_name`, and a
+            `summary` preview — enough to know what every attachment is
+            WITHOUT calling `get_document` per id. Only call
+            `get_document`/`read_document_content` on documents you need
+            to inspect in depth.
 
         - name: get_relationships
           method: GET
@@ -945,7 +958,25 @@ spec:
               sequence: { type: integer }
               claim_text: { type: string }
               claim_type: { type: string }
+              evidence:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    document_id: { type: string, format: uuid }
+                    document_version_id: { type: string, format: uuid }
+                    span: { type: object }
+                    stance:
+                      type: string
+                      enum: [supports, contradicts, qualifies]
+                    relevance: { type: number }
+                  required: [document_id, span]
             required: [answer_id, sequence, claim_text]
+          description: |
+            Draft one claim, binding its evidence in the same call: pass the
+            supporting spans in `evidence` instead of calling `bind_evidence`
+            once per span afterwards. Use `bind_evidence` only to add
+            evidence to a claim you already drafted.
 
         - name: bind_evidence
           method: POST
@@ -972,6 +1003,29 @@ spec:
               reasoning: { type: string }
             required: [evidence_id, validated, reasoning]
 
+        - name: record_validation_verdicts
+          method: POST
+          path: /api/v1/synthesis/answers/{{ answer_id }}/verdicts
+          parameters:
+            type: object
+            properties:
+              answer_id: { type: string, format: uuid }
+              verdicts:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    evidence_id: { type: string, format: uuid }
+                    validated: { type: boolean }
+                    reasoning: { type: string }
+                  required: [evidence_id, validated, reasoning]
+            required: [answer_id, verdicts]
+          description: |
+            Record verdicts for many evidence rows of one answer in a single
+            call — prefer this over per-row `record_validation_verdict` once
+            you have judged a batch. All-or-nothing: every evidence_id must
+            belong to the answer or the whole batch is rejected.
+
         - name: publish_answer
           method: POST
           path: /api/v1/synthesis/answers/{{ answer_id }}/publish
@@ -982,6 +1036,20 @@ spec:
             required: [answer_id]
 
         # ── answer reads (let the faithfulness validator enumerate evidence) ──
+        - name: get_answer_evidence
+          method: GET
+          path: /api/v1/answers/{{ answer_id }}/evidence
+          parameters:
+            type: object
+            properties:
+              answer_id: { type: string, format: uuid }
+            required: [answer_id]
+          description: |
+            Every claim of the answer with its evidence rows nested, in one
+            call — use this instead of `get_answer_claims` followed by one
+            `get_claim_evidence` call per claim. Each evidence row carries
+            its `id`, span, stance, and `validated` flag.
+
         - name: get_answer_claims
           method: GET
           path: /api/v1/answers/{{ answer_id }}/claims
@@ -1501,9 +1569,14 @@ spec:
         Loop:
           1. Call `create_draft_result` with the query. You receive
              `result_id` and `filter_version=0`.
-          2. Call `introspect_by_result(result_id)`. Read the
-             distributions: which fields have small, discriminating
-             value sets? Which values match the query's intent?
+          2. Call `introspect_by_result(result_id)`. On the FIRST call
+             leave `fields` unset to see every property's distribution
+             and learn which fields discriminate; on every later call
+             pass `fields` with only the properties you are still
+             deciding on — the full-breadth response is expensive and
+             you re-read it each turn. Read the distributions: which
+             fields have small, discriminating value sets? Which
+             values match the query's intent?
              Each field's distribution is faceted — it reflects all
              your OTHER filters but not that field's own filter. So if
              you've narrowed `sector_targeted=Pharmaceutical`, the
@@ -1708,19 +1781,22 @@ spec:
           3. Call `list_applicable_playbooks(kind=synthesis, …)` to see
              which synthesis playbooks are in scope, then `get_playbook`
              on the one whose `question patterns` match this question.
-          4. Read the source's documents:
-               - result-driven: `get_result_documents`, then
-                 `get_document_summary`/`read_document_content` per
-                 document
-               - dossier-driven: `list_dossier_documents`, then read
-                 each
-          5. Draft claims one by one:
-               a. Call `draft_claim` with the next claim's text and
-                  type. Capture the returned claim_id.
-               b. For each piece of evidence supporting that claim,
-                  call `bind_evidence` with the document_id, version,
-                  and a precise span.
-               c. Use `stance: "qualifies"` when the cited span limits
+          4. Survey the source's documents:
+               - result-driven: `get_result_documents` — each row
+                 already carries the filename, class, and a summary
+                 preview, which is your survey of the whole set in ONE
+                 call. Do NOT call `get_document` per row.
+               - dossier-driven: `list_dossier_documents`.
+             Then call `read_document_content` only on the documents
+             you will actually draw claims from — you need the exact
+             span (line_from/line_to) of every piece of evidence you
+             bind, and spans come from reading, never from summaries.
+          5. Draft claims one by one, each WITH its evidence:
+               a. Call `draft_claim` with the claim's text, type, and
+                  the supporting spans in `evidence` — one call per
+                  claim. Only use `bind_evidence` when you later need
+                  to add evidence to an already-drafted claim.
+               b. Use `stance: "qualifies"` when the cited span limits
                   the claim, `"contradicts"` only when explicitly
                   presenting contrasting evidence.
           6. Invoke `faithfulness-validator-agent` on the answer.
@@ -1937,20 +2013,22 @@ spec:
 
         Workflow:
           1. Receive an answer_id.
-          2. Call `get_answer_claims(answer_id)` to list every claim, then
-             `get_claim_evidence(claim_id)` per claim to list every evidence
-             row. Each evidence row has an `id` and a `validated` flag.
-          3. For each evidence row not already `validated: true`:
-              a. Read the claim text and the cited span via
-                 `read_document_content` (use the span's line_from/line_to).
-              b. Judge whether the span supports the claim with the
-                 declared stance.
-              c. Call `record_validation_verdict` with the row's
-                 `evidence_id`, `validated: true`/`false`, and a
-                 one-sentence reasoning.
-             Validate EVERY evidence row of EVERY claim. Enumerate them
+          2. Call `get_answer_evidence(answer_id)` — ONE call that returns
+             every claim with its evidence rows nested. Each evidence row
+             has an `id` and a `validated` flag. Enumerate the evidence
              yourself; do not rely on ids passed in the invocation message.
-          4. Reply with a per-claim summary. Be strict: if a span only
+          3. For each evidence row not already `validated: true`:
+              a. Read the cited span via `read_document_content` (use the
+                 span's line_from/line_to). Spans in the same document can
+                 share one read: fetch a window covering them and judge
+                 each against it.
+              b. Judge whether the span supports the claim with the
+                 declared stance. Note the verdict; don't record it yet.
+          4. Record all verdicts in ONE `record_validation_verdicts` call
+             (or a few batches for a large answer): a list of
+             {evidence_id, validated, reasoning} with a one-sentence
+             reasoning each. Cover EVERY evidence row of EVERY claim.
+          5. Reply with a per-claim summary. Be strict: if a span only
              tangentially relates to the claim, fail it.
 
         Your verdict gates publishing. Do not be lenient — better to
@@ -1959,7 +2037,7 @@ spec:
       enabledConnectors:
         - connector: grove/api
           operations:
-            - get_answer_claims
-            - get_claim_evidence
+            - get_answer_evidence
             - read_document_content
+            - record_validation_verdicts
             - record_validation_verdict

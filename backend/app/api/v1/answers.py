@@ -11,7 +11,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth import CallerIdentity, get_caller
 from app.db import get_session
 from app.models import Answer, AnswerClaim, ClaimEvidence
-from app.schemas.runtime import AnswerOut, ClaimEvidenceOut, ClaimOut
+from app.schemas.runtime import (
+    AnswerOut,
+    ClaimEvidenceOut,
+    ClaimOut,
+    ClaimWithEvidenceOut,
+)
 from app.services.visibility import visible_clause
 
 router = APIRouter(prefix="/answers", tags=["answers"])
@@ -63,6 +68,41 @@ async def get_answer_claims(answer_id: uuid.UUID, session: AsyncSession = Depend
         )
     ).scalars().all()
     return rows
+
+
+@router.get("/{answer_id}/evidence", response_model=list[ClaimWithEvidenceOut])
+async def get_answer_evidence(
+    answer_id: uuid.UUID, session: AsyncSession = Depends(get_session)
+):
+    """Every claim of the answer with its evidence rows nested, in claim
+    order — the whole evidence set in one call, instead of get_answer_claims
+    plus one get_claim_evidence call per claim."""
+    claims = (
+        await session.execute(
+            select(AnswerClaim)
+            .where(AnswerClaim.answer_id == answer_id)
+            .order_by(AnswerClaim.sequence)
+        )
+    ).scalars().all()
+    evidence = (
+        await session.execute(
+            select(ClaimEvidence)
+            .join(AnswerClaim, AnswerClaim.id == ClaimEvidence.claim_id)
+            .where(AnswerClaim.answer_id == answer_id)
+        )
+    ).scalars().all()
+    by_claim: dict[uuid.UUID, list[ClaimEvidence]] = {}
+    for row in evidence:
+        by_claim.setdefault(row.claim_id, []).append(row)
+    return [
+        ClaimWithEvidenceOut(
+            **ClaimOut.model_validate(c).model_dump(),
+            evidence=[
+                ClaimEvidenceOut.model_validate(e) for e in by_claim.get(c.id, [])
+            ],
+        )
+        for c in claims
+    ]
 
 
 @router.get("/claims/{claim_id}/evidence", response_model=list[ClaimEvidenceOut])

@@ -13,7 +13,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth import CallerIdentity, get_caller, require_permission
 from app.db import get_session
 from app.models import Answer, AnswerClaim, ClaimEvidence, Result
-from app.schemas.runtime import ClaimEvidenceIn, ClaimEvidenceOut, ClaimOut
+from app.schemas.runtime import (
+    ClaimEvidenceIn,
+    ClaimEvidenceOut,
+    ClaimOut,
+    ClaimWithEvidenceOut,
+)
 
 router = APIRouter(prefix="/synthesis", tags=["synthesis"])
 
@@ -65,11 +70,15 @@ class DraftClaimIn(BaseModel):
     sequence: int
     claim_text: str
     claim_type: str | None = None
+    # Evidence bound in the same call — one round-trip per claim instead of
+    # draft_claim + one bind_evidence call per span. bind_evidence stays for
+    # adding evidence to an already-drafted claim.
+    evidence: list[ClaimEvidenceIn] = []
 
 
 @router.post(
     "/answers/{answer_id}/claims",
-    response_model=ClaimOut,
+    response_model=ClaimWithEvidenceOut,
     status_code=status.HTTP_201_CREATED,
     dependencies=[Depends(require_permission("grove.answers.write:own"))],
 )
@@ -78,11 +87,32 @@ async def draft_claim(
     payload: DraftClaimIn,
     session: AsyncSession = Depends(get_session),
 ):
-    row = AnswerClaim(answer_id=answer_id, **payload.model_dump())
+    row = AnswerClaim(
+        answer_id=answer_id,
+        **payload.model_dump(exclude={"evidence"}),
+    )
     session.add(row)
+    await session.flush()  # claim id for the evidence FKs
+    ev_rows = [
+        ClaimEvidence(
+            claim_id=row.id,
+            document_id=ev.document_id,
+            document_version_id=ev.document_version_id,
+            span=ev.span.model_dump(),
+            stance=ev.stance,
+            relevance=ev.relevance,
+        )
+        for ev in payload.evidence
+    ]
+    session.add_all(ev_rows)
     await session.commit()
     await session.refresh(row)
-    return row
+    for ev_row in ev_rows:
+        await session.refresh(ev_row)
+    return ClaimWithEvidenceOut(
+        **ClaimOut.model_validate(row).model_dump(),
+        evidence=[ClaimEvidenceOut.model_validate(e) for e in ev_rows],
+    )
 
 
 @router.post(
@@ -131,6 +161,54 @@ async def record_validation_verdict(
     row.validation_reasoning = payload.reasoning
     await session.commit()
     return {"ok": True}
+
+
+class VerdictEntry(ValidationVerdict):
+    evidence_id: uuid.UUID
+
+
+class BulkVerdictsIn(BaseModel):
+    verdicts: list[VerdictEntry]
+
+
+@router.post(
+    "/answers/{answer_id}/verdicts",
+    dependencies=[Depends(require_permission("grove.answers.write:own"))],
+)
+async def record_validation_verdicts(
+    answer_id: uuid.UUID,
+    payload: BulkVerdictsIn,
+    session: AsyncSession = Depends(get_session),
+):
+    """Record verdicts for many evidence rows of one answer in a single call.
+
+    All-or-nothing: every evidence_id must belong to the answer, or the whole
+    batch is rejected — a partial write would let a caller believe rows were
+    validated that weren't.
+    """
+    if not payload.verdicts:
+        return {"ok": True, "updated": 0}
+    rows = (
+        await session.execute(
+            select(ClaimEvidence)
+            .join(AnswerClaim, AnswerClaim.id == ClaimEvidence.claim_id)
+            .where(AnswerClaim.answer_id == answer_id)
+            .where(ClaimEvidence.id.in_([v.evidence_id for v in payload.verdicts]))
+        )
+    ).scalars().all()
+    by_id = {r.id: r for r in rows}
+    missing = [str(v.evidence_id) for v in payload.verdicts if v.evidence_id not in by_id]
+    if missing:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            f"evidence not found on this answer: {', '.join(missing)}",
+        )
+    for v in payload.verdicts:
+        row = by_id[v.evidence_id]
+        row.validated = v.validated
+        row.validation_reasoning = v.reasoning
+    await session.commit()
+    return {"ok": True, "updated": len(payload.verdicts)}
 
 
 @router.post(

@@ -205,6 +205,12 @@ class ResultDocumentOut(TimestampedOut):
     rank: int | None = None
     reason: str | None = None
     added_by_agent: str | None = None
+    # Identifying fields, joined from the document so a reader (the synthesis
+    # agent, the UI) doesn't need a get_document call per row just to learn
+    # what each attached document is. Same shape as MatchingDocumentOut.
+    filename: str | None = None
+    document_class_name: str | None = None
+    summary: str | None = None
 
 
 class AnswerOut(OwnedOut):
@@ -239,6 +245,14 @@ class ClaimEvidenceOut(TimestampedOut):
     relevance: float | None = None
     validated: bool
     validation_reasoning: str | None = None
+
+
+class ClaimWithEvidenceOut(ClaimOut):
+    """A claim with its evidence rows nested — lets a caller (the
+    faithfulness validator) enumerate an answer's full evidence set in one
+    call instead of one get_claim_evidence call per claim."""
+
+    evidence: list[ClaimEvidenceOut] = []
 
 
 # ─────────────────────────────────────────────────────────────
@@ -306,7 +320,10 @@ class GroveFilter(BaseModel):
 class IntrospectIn(BaseModel):
     filter: GroveFilter | None = None
     fields: list[str] | None = None
-    top_k: int = 25
+    # 10 values per facet is enough to pick the next narrowing filter; the
+    # response is re-read by the agent on every turn, so the default leans
+    # small. Callers that genuinely need the long tail can raise it.
+    top_k: int = Field(default=10, ge=1, le=100)
 
 
 class IntrospectFieldDistribution(ORMModel):
