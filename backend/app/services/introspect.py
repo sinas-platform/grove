@@ -14,12 +14,12 @@ from __future__ import annotations
 import uuid
 from typing import Any
 
-from sqlalchemy import and_, exists, func, or_, select
+from sqlalchemy import and_, exists, func, literal_column, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import literal
 
 from app.auth import CallerIdentity
-from app.models import Document, DocumentClassProperty, PropertyValue
+from app.models import Document, DocumentClassProperty, DocumentVersion, PropertyValue
 from app.schemas.runtime import (
     FieldFilter,
     GroveFilter,
@@ -132,11 +132,23 @@ def apply_grove_filter(
     if f.text_search:
         from sqlalchemy import text as sql_text
 
+        # websearch_to_tsquery gives callers web-search syntax: terms are
+        # AND-ed by default, `OR` unions, `-term` excludes, and "quoted
+        # phrases" match adjacent words. The query is passed through raw so
+        # the caller decides the semantics; malformed input never raises.
+        #
+        # The regconfig MUST be 'simple', matching the trigger that builds
+        # content_tsvector (0001_baseline). Relying on the session default
+        # ('english' in practice) stems query terms — dominance→domin,
+        # competition→competit — which can never match the unstemmed lexemes
+        # in a 'simple' index, silently zeroing most matches.
         stmt = stmt.where(
             Document.id.in_(
                 select(sql_text("document_version.document_id"))
                 .select_from(sql_text("document_version"))
-                .where(sql_text("content_tsvector @@ plainto_tsquery(:q)"))
+                .where(
+                    sql_text("content_tsvector @@ websearch_to_tsquery('simple', :q)")
+                )
                 .params(q=f.text_search)
             )
         )
@@ -169,15 +181,43 @@ async def matching_document_ids(
 
     Same selection logic as `count_candidates` — visibility scope plus
     `apply_grove_filter` — but enumerates the matches so the caller can pull
-    them into a Result. `DISTINCT` guards against row fan-out if a future
-    clause joins; ordered by id for stable truncation under `limit`.
+    them into a Result. With a text search active, results are ordered by FTS
+    relevance so the top `limit` are the best matches; otherwise by id for
+    stable truncation.
+
+    Relevance ranks the same rows the filter matched on: every version whose
+    tsvector satisfies the query, aggregated per document with MAX. Ranking
+    only the current version would score documents on text the filter never
+    matched, and an inner join on `current_version_id` (nullable) would drop
+    matched documents outright.
     """
     read_all = await caller.has_permission("grove.documents.read:all")
     stmt = select(Document.id).where(
         visible_clause(Document, caller, read_all=read_all)
     )
     stmt = apply_grove_filter(stmt, f)
-    stmt = stmt.distinct().order_by(Document.id).limit(limit)
+    if f.text_search:
+        # 'simple' pinned to match the index build — see apply_grove_filter.
+        # literal_column keeps it an unquoted-literal regconfig rather than a
+        # text bind param, which asyncpg would fail to resolve to a regconfig.
+        tsquery = func.websearch_to_tsquery(
+            literal_column("'simple'"), f.text_search
+        )
+        rank = func.max(func.ts_rank(DocumentVersion.content_tsvector, tsquery))
+        stmt = (
+            stmt.join(
+                DocumentVersion,
+                and_(
+                    DocumentVersion.document_id == Document.id,
+                    DocumentVersion.content_tsvector.op("@@")(tsquery),
+                ),
+            )
+            .group_by(Document.id)
+            .order_by(rank.desc(), Document.id)
+            .limit(limit)
+        )
+    else:
+        stmt = stmt.distinct().order_by(Document.id).limit(limit)
     rows = (await session.execute(stmt)).scalars().all()
     return list(rows)
 

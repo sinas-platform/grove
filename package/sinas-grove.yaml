@@ -435,6 +435,12 @@ spec:
                 type: array
                 items: { type: string }
               top_k: { type: integer }
+          description: |
+            Count the documents matching the filter and return faceted value
+            distributions for the requested fields. `filter.text_search` uses
+            web-search syntax: terms are AND-ed by default, `OR` unions terms,
+            `-term` excludes, and "quoted phrases" match adjacent words —
+            e.g. `"climate adaptation" OR flood -insurance`.
 
         - name: matching_documents
           method: POST
@@ -447,9 +453,14 @@ spec:
           description: |
             Enumerate the document ids matching the filter — the companion to
             `introspect`, which only returns counts and value distributions.
-            Same filter body as introspect. Returns {document_ids: [...]},
-            capped by `limit` (default 50, max 200). Use it to pull the actual
-            matches into a draft Result via `add_files_to_result`.
+            Same filter body as introspect, including web-search syntax in
+            `filter.text_search` (AND by default, `OR`, `-term`, "quoted
+            phrases"). Returns {document_ids: [...]}, capped by `limit`
+            (default 50, max 200). When the filter has a `text_search`, ids
+            are ordered most-relevant first, so a truncated response keeps
+            the best matches; without one the order is arbitrary (by id).
+            Use it to pull the actual matches into a draft Result via
+            `add_files_to_result`.
 
         - name: create_draft_result
           method: POST
@@ -682,7 +693,11 @@ spec:
               filter_version: { type: integer }
               query: { type: string }
             required: [result_id, filter_version, query]
-          description: Set the full-text-search query on this filter.
+          description: |
+            Set the full-text-search query on this filter. The query uses
+            web-search syntax: terms are AND-ed by default, `OR` unions
+            terms, `-term` excludes, and "quoted phrases" match adjacent
+            words — e.g. `"supply chain" OR logistics -aviation`.
 
         - name: clear_text_search
           method: POST
@@ -1499,7 +1514,12 @@ spec:
                - `set_field_filter` / `extend_field_filter_values` /
                  `shrink_field_filter_values` / `remove_field_filter`
                  for property filters
-               - `set_text_search` / `clear_text_search` for FTS
+               - `set_text_search` / `clear_text_search` for FTS.
+                 Text queries take web-search syntax: terms AND by
+                 default, `OR` to union, `-term` to exclude, "quoted
+                 phrases" for adjacency. Start strict (AND, phrases)
+                 and widen with `OR` if the candidate count drops too
+                 low — introspect after each change shows the effect.
                - `add_explicit_includes` / `add_explicit_excludes` for
                  pin/block
                - `clear_filter` / `replace_filter` for resets
