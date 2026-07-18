@@ -12,6 +12,7 @@ from app.auth import CallerIdentity, get_caller
 from app.db import get_session
 from app.models import Document, DocumentClass, Result, ResultDocument, ResultTrace
 from app.services.introspect import SUMMARY_PREVIEW_CHARS
+from app.services.result_filter import load_visible_result
 from app.schemas.common import TraceOut
 from app.schemas.runtime import ResultDocumentOut, ResultOut
 from app.services.visibility import visible_clause
@@ -43,22 +44,16 @@ async def get_result(
     session: AsyncSession = Depends(get_session),
     caller: CallerIdentity = Depends(get_caller),
 ):
-    read_all = await caller.has_permission("grove.results.read:all")
-    stmt = (
-        select(Result)
-        .where(Result.id == result_id)
-        .where(visible_clause(Result, caller, read_all=read_all))
-    )
-    row = (await session.execute(stmt)).scalar_one_or_none()
-    if row is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "result not found")
-    return row
+    return await load_visible_result(session, caller, result_id, for_write=False)
 
 
 @router.get("/{result_id}/documents", response_model=list[ResultDocumentOut])
 async def get_result_documents(
-    result_id: uuid.UUID, session: AsyncSession = Depends(get_session)
+    result_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    caller: CallerIdentity = Depends(get_caller),
 ):
+    await load_visible_result(session, caller, result_id, for_write=False)
     """Attached documents with identifying fields joined in (filename, class
     name, summary preview), so a reader doesn't need a get_document call per
     row to learn what each attachment is."""
@@ -90,7 +85,12 @@ async def get_result_documents(
 
 
 @router.get("/{result_id}/trace", response_model=list[TraceOut])
-async def get_trace(result_id: uuid.UUID, session: AsyncSession = Depends(get_session)):
+async def get_trace(
+    result_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    caller: CallerIdentity = Depends(get_caller),
+):
+    await load_visible_result(session, caller, result_id, for_write=False)
     rows = (
         await session.execute(
             select(ResultTrace)

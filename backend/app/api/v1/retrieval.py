@@ -131,12 +131,12 @@ async def add_files_to_result(
     result_id: uuid.UUID,
     payload: AddFilesIn,
     session: AsyncSession = Depends(get_session),
+    caller: CallerIdentity = Depends(get_caller),
 ):
-    from app.models import Result, ResultDocument
+    from app.models import ResultDocument
+    from app.services.result_filter import load_visible_result
 
-    result = await session.get(Result, result_id)
-    if result is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "result not found")
+    await load_visible_result(session, caller, result_id, for_write=True)
     for did in payload.document_ids:
         session.add(
             ResultDocument(
@@ -158,11 +158,14 @@ async def append_trace(
     result_id: uuid.UUID,
     payload: TraceIn,
     session: AsyncSession = Depends(get_session),
+    caller: CallerIdentity = Depends(get_caller),
 ):
     from datetime import datetime, timezone
 
     from app.models import ResultTrace
+    from app.services.result_filter import load_visible_result
 
+    await load_visible_result(session, caller, result_id, for_write=True)
     session.add(
         ResultTrace(
             result_id=result_id,
@@ -183,15 +186,15 @@ async def append_trace(
     dependencies=[Depends(require_permission("grove.results.write:own"))],
 )
 async def publish_result(
-    result_id: uuid.UUID, session: AsyncSession = Depends(get_session)
+    result_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    caller: CallerIdentity = Depends(get_caller),
 ):
     from datetime import datetime, timezone
 
-    from app.models import Result
+    from app.services.result_filter import load_visible_result
 
-    result = await session.get(Result, result_id)
-    if result is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "result not found")
+    result = await load_visible_result(session, caller, result_id, for_write=True)
     result.status = "published"
     result.published_at = datetime.now(timezone.utc)
     await session.commit()

@@ -37,6 +37,7 @@ from app.models import (
 from app.schemas.result_filter import FilterMutationOut
 from app.schemas.runtime import FieldFilter, GroveFilter, IntrospectOut, RegexFilter
 from app.services.introspect import count_candidates, introspect_with_filter
+from app.services.visibility import visible_clause
 
 
 # Author attribution for server-written trace rows. Agents writing narrative
@@ -48,10 +49,37 @@ AUTO_TRACE_AGENT = "grove"
 # ───────────────────────────── core helpers ─────────────────────────────
 
 
-async def _load_draft_result(session: AsyncSession, result_id: uuid.UUID) -> Result:
-    row = await session.get(Result, result_id)
+async def load_visible_result(
+    session: AsyncSession,
+    caller: CallerIdentity,
+    result_id: uuid.UUID,
+    *,
+    for_write: bool,
+) -> Result:
+    """Load a result the caller may see (or, `for_write`, mutate): owner,
+    shared role, or the corresponding `:all` permission. 404 on rows outside
+    that scope so invisible ids don't leak existence. The `write:own` /
+    `read:own` permission gate stays at the route layer; this enforces the
+    "own" part the gate alone cannot."""
+    lift = await caller.has_permission(
+        "grove.results.write:all" if for_write else "grove.results.read:all"
+    )
+    row = (
+        await session.execute(
+            select(Result)
+            .where(Result.id == result_id)
+            .where(visible_clause(Result, caller, read_all=lift))
+        )
+    ).scalar_one_or_none()
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "result not found")
+    return row
+
+
+async def _load_draft_result(
+    session: AsyncSession, caller: CallerIdentity, result_id: uuid.UUID
+) -> Result:
+    row = await load_visible_result(session, caller, result_id, for_write=True)
     if row.status == "published":
         raise HTTPException(
             status.HTTP_409_CONFLICT,
@@ -84,7 +112,7 @@ async def _mutate_filter(
     parameters: dict[str, Any],
     transform: Callable[[GroveFilter], GroveFilter],
 ) -> FilterMutationOut:
-    result = await _load_draft_result(session, result_id)
+    result = await _load_draft_result(session, caller, result_id)
     if result.filter_version != expected_version:
         raise HTTPException(
             status.HTTP_409_CONFLICT,
@@ -539,7 +567,7 @@ async def remove_files_from_result(
     reason: str | None,
 ) -> tuple[int, int]:
     """Returns (remaining_doc_count, trace_sequence)."""
-    result = await _load_draft_result(session, result_id)
+    result = await _load_draft_result(session, caller, result_id)
     if document_ids:
         await session.execute(
             delete(ResultDocument)
@@ -583,7 +611,7 @@ async def clear_result_files(
     result_id: uuid.UUID,
 ) -> tuple[int, int]:
     """Returns (remaining_doc_count=0, trace_sequence)."""
-    result = await _load_draft_result(session, result_id)
+    result = await _load_draft_result(session, caller, result_id)
     await session.execute(
         delete(ResultDocument).where(ResultDocument.result_id == result_id)
     )
@@ -625,9 +653,7 @@ async def introspect_by_result(
     stored lists. Useful for the agent to probe "what would this clause do?"
     without committing it.
     """
-    result = await session.get(Result, result_id)
-    if result is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "result not found")
+    result = await load_visible_result(session, caller, result_id, for_write=False)
 
     stored = GroveFilter(**(result.filter or {}))
     effective = stored if overlay is None else _merge_overlay(stored, overlay)

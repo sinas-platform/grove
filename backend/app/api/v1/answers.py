@@ -22,6 +22,21 @@ from app.services.visibility import visible_clause
 router = APIRouter(prefix="/answers", tags=["answers"])
 
 
+async def _visible_answer_or_404(
+    answer_id: uuid.UUID, session: AsyncSession, caller: CallerIdentity
+) -> Answer:
+    read_all = await caller.has_permission("grove.answers.read:all")
+    stmt = (
+        select(Answer)
+        .where(Answer.id == answer_id)
+        .where(visible_clause(Answer, caller, read_all=read_all))
+    )
+    row = (await session.execute(stmt)).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "answer not found")
+    return row
+
+
 @router.get("", response_model=list[AnswerOut])
 async def list_answers(
     session: AsyncSession = Depends(get_session),
@@ -46,20 +61,16 @@ async def get_answer(
     session: AsyncSession = Depends(get_session),
     caller: CallerIdentity = Depends(get_caller),
 ):
-    read_all = await caller.has_permission("grove.answers.read:all")
-    stmt = (
-        select(Answer)
-        .where(Answer.id == answer_id)
-        .where(visible_clause(Answer, caller, read_all=read_all))
-    )
-    row = (await session.execute(stmt)).scalar_one_or_none()
-    if row is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "answer not found")
-    return row
+    return await _visible_answer_or_404(answer_id, session, caller)
 
 
 @router.get("/{answer_id}/claims", response_model=list[ClaimOut])
-async def get_answer_claims(answer_id: uuid.UUID, session: AsyncSession = Depends(get_session)):
+async def get_answer_claims(
+    answer_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    caller: CallerIdentity = Depends(get_caller),
+):
+    await _visible_answer_or_404(answer_id, session, caller)
     rows = (
         await session.execute(
             select(AnswerClaim)
@@ -72,11 +83,14 @@ async def get_answer_claims(answer_id: uuid.UUID, session: AsyncSession = Depend
 
 @router.get("/{answer_id}/evidence", response_model=list[ClaimWithEvidenceOut])
 async def get_answer_evidence(
-    answer_id: uuid.UUID, session: AsyncSession = Depends(get_session)
+    answer_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    caller: CallerIdentity = Depends(get_caller),
 ):
     """Every claim of the answer with its evidence rows nested, in claim
     order — the whole evidence set in one call, instead of get_answer_claims
     plus one get_claim_evidence call per claim."""
+    await _visible_answer_or_404(answer_id, session, caller)
     claims = (
         await session.execute(
             select(AnswerClaim)
@@ -106,7 +120,22 @@ async def get_answer_evidence(
 
 
 @router.get("/claims/{claim_id}/evidence", response_model=list[ClaimEvidenceOut])
-async def get_claim_evidence(claim_id: uuid.UUID, session: AsyncSession = Depends(get_session)):
+async def get_claim_evidence(
+    claim_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    caller: CallerIdentity = Depends(get_caller),
+):
+    read_all = await caller.has_permission("grove.answers.read:all")
+    claim = (
+        await session.execute(
+            select(AnswerClaim)
+            .join(Answer, Answer.id == AnswerClaim.answer_id)
+            .where(AnswerClaim.id == claim_id)
+            .where(visible_clause(Answer, caller, read_all=read_all))
+        )
+    ).scalar_one_or_none()
+    if claim is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "claim not found")
     rows = (
         await session.execute(
             select(ClaimEvidence).where(ClaimEvidence.claim_id == claim_id)

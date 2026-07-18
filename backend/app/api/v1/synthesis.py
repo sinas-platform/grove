@@ -12,15 +12,49 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import CallerIdentity, get_caller, require_permission
 from app.db import get_session
-from app.models import Answer, AnswerClaim, ClaimEvidence, Result
+from app.models import Answer, AnswerClaim, ClaimEvidence
 from app.schemas.runtime import (
     ClaimEvidenceIn,
     ClaimEvidenceOut,
     ClaimOut,
     ClaimWithEvidenceOut,
 )
+from app.services.result_filter import load_visible_result
+from app.services.visibility import visible_clause
 
 router = APIRouter(prefix="/synthesis", tags=["synthesis"])
+
+
+async def _writable_answer_or_404(
+    answer_id: uuid.UUID, session: AsyncSession, caller: CallerIdentity
+) -> Answer:
+    # write:own means the answer must be visible to the caller; write:all lifts that.
+    write_all = await caller.has_permission("grove.answers.write:all")
+    stmt = (
+        select(Answer)
+        .where(Answer.id == answer_id)
+        .where(visible_clause(Answer, caller, read_all=write_all))
+    )
+    row = (await session.execute(stmt)).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "answer not found")
+    return row
+
+
+async def _writable_claim_or_404(
+    claim_id: uuid.UUID, session: AsyncSession, caller: CallerIdentity
+) -> AnswerClaim:
+    write_all = await caller.has_permission("grove.answers.write:all")
+    stmt = (
+        select(AnswerClaim)
+        .join(Answer, Answer.id == AnswerClaim.answer_id)
+        .where(AnswerClaim.id == claim_id)
+        .where(visible_clause(Answer, caller, read_all=write_all))
+    )
+    row = (await session.execute(stmt)).scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "claim not found")
+    return row
 
 
 class StartAnswerIn(BaseModel):
@@ -45,11 +79,14 @@ async def start_answer(
         )
 
     # If a source result is specified, inherit its owner+roles for the answer.
+    # The result must be visible to the caller — otherwise an arbitrary id
+    # would leak its existence and let the caller mint answers owned by
+    # someone else.
     owner_id, roles = caller.user_id, list(caller.roles or [])
     if payload.source_result_id:
-        result = await session.get(Result, payload.source_result_id)
-        if result is None:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "source result not found")
+        result = await load_visible_result(
+            session, caller, payload.source_result_id, for_write=False
+        )
         owner_id = result.owner_id
         roles = list(result.roles or [])
 
@@ -86,7 +123,9 @@ async def draft_claim(
     answer_id: uuid.UUID,
     payload: DraftClaimIn,
     session: AsyncSession = Depends(get_session),
+    caller: CallerIdentity = Depends(get_caller),
 ):
+    await _writable_answer_or_404(answer_id, session, caller)
     row = AnswerClaim(
         answer_id=answer_id,
         **payload.model_dump(exclude={"evidence"}),
@@ -125,7 +164,9 @@ async def bind_evidence(
     claim_id: uuid.UUID,
     payload: ClaimEvidenceIn,
     session: AsyncSession = Depends(get_session),
+    caller: CallerIdentity = Depends(get_caller),
 ):
+    await _writable_claim_or_404(claim_id, session, caller)
     row = ClaimEvidence(
         claim_id=claim_id,
         document_id=payload.document_id,
@@ -153,8 +194,18 @@ async def record_validation_verdict(
     evidence_id: uuid.UUID,
     payload: ValidationVerdict,
     session: AsyncSession = Depends(get_session),
+    caller: CallerIdentity = Depends(get_caller),
 ):
-    row = await session.get(ClaimEvidence, evidence_id)
+    write_all = await caller.has_permission("grove.answers.write:all")
+    row = (
+        await session.execute(
+            select(ClaimEvidence)
+            .join(AnswerClaim, AnswerClaim.id == ClaimEvidence.claim_id)
+            .join(Answer, Answer.id == AnswerClaim.answer_id)
+            .where(ClaimEvidence.id == evidence_id)
+            .where(visible_clause(Answer, caller, read_all=write_all))
+        )
+    ).scalar_one_or_none()
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "evidence not found")
     row.validated = payload.validated
@@ -179,6 +230,7 @@ async def record_validation_verdicts(
     answer_id: uuid.UUID,
     payload: BulkVerdictsIn,
     session: AsyncSession = Depends(get_session),
+    caller: CallerIdentity = Depends(get_caller),
 ):
     """Record verdicts for many evidence rows of one answer in a single call.
 
@@ -186,6 +238,7 @@ async def record_validation_verdicts(
     batch is rejected — a partial write would let a caller believe rows were
     validated that weren't.
     """
+    await _writable_answer_or_404(answer_id, session, caller)
     if not payload.verdicts:
         return {"ok": True, "updated": 0}
     rows = (
@@ -216,11 +269,11 @@ async def record_validation_verdicts(
     dependencies=[Depends(require_permission("grove.answers.write:own"))],
 )
 async def publish_answer(
-    answer_id: uuid.UUID, session: AsyncSession = Depends(get_session)
+    answer_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    caller: CallerIdentity = Depends(get_caller),
 ):
-    row = await session.get(Answer, answer_id)
-    if row is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "answer not found")
+    row = await _writable_answer_or_404(answer_id, session, caller)
 
     # Refuse to publish if any claim has unvalidated evidence
     bad = (
