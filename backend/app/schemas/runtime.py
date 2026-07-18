@@ -325,5 +325,22 @@ class MatchingDocumentsIn(BaseModel):
     limit: int = Field(default=50, ge=1, le=200)
 
 
+class MatchingDocumentOut(BaseModel):
+    """One matched document, with just enough to identify it without a
+    follow-up get_document call. filename is often a numeric id, so the
+    class name and summary preview are what actually tell the caller what
+    the document is."""
+
+    id: uuid.UUID
+    filename: str
+    document_class_id: uuid.UUID | None = None
+    document_class_name: str | None = None
+    summary: str | None = None
+
+
 class MatchingDocumentsOut(BaseModel):
+    # document_ids stays for callers that only need the ids; documents adds
+    # the identifying fields alongside. Both describe the same matches in the
+    # same order.
     document_ids: list[uuid.UUID]
+    documents: list[MatchingDocumentOut] = []

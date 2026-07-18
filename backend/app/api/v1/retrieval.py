@@ -21,10 +21,14 @@ from app.schemas.runtime import (
     GroveFilter,
     IntrospectIn,
     IntrospectOut,
+    MatchingDocumentOut,
     MatchingDocumentsIn,
     MatchingDocumentsOut,
 )
-from app.services.introspect import introspect_with_filter, matching_document_ids
+from app.services.introspect import (
+    introspect_with_filter,
+    matching_document_summaries,
+)
 
 router = APIRouter(prefix="/retrieval", tags=["retrieval"])
 
@@ -48,15 +52,29 @@ async def matching_documents(
     session: AsyncSession = Depends(get_session),
     caller: CallerIdentity = Depends(get_caller),
 ):
-    """Enumerate the document ids matching the filter.
+    """Enumerate the documents matching the filter.
 
     Companion to `/introspect`: introspect answers HOW MANY documents match and
     their value distribution; this answers WHICH ones, so the agent can add them
-    to a Result. Same filter body and query logic, capped by `limit` (default
-    50, max 200)."""
+    to a Result. Each match carries its filename, class, and a summary preview,
+    so the caller can tell what a document is without a follow-up get_document.
+    Same filter body and query logic, capped by `limit` (default 50, max 200)."""
     f = payload.filter or GroveFilter()
-    ids = await matching_document_ids(session, caller, f, payload.limit)
-    return MatchingDocumentsOut(document_ids=ids)
+    rows = await matching_document_summaries(session, caller, f, payload.limit)
+    documents = [
+        MatchingDocumentOut(
+            id=r[0],
+            filename=r[1],
+            document_class_id=r[2],
+            document_class_name=r[3],
+            summary=r[4],
+        )
+        for r in rows
+    ]
+    return MatchingDocumentsOut(
+        document_ids=[d.id for d in documents],
+        documents=documents,
+    )
 
 
 # ───────────────────── draft result mutation operations ─────────────────────
