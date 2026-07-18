@@ -17,14 +17,22 @@ Grove turns unstructured documents into a structured, filterable graph and expos
 
 Grove depends on a running Sinas instance for agents, file storage, RBAC, and skills. Standalone deployment is not supported in v1.
 
-> **Sinas setting required:** set `MAX_TOOL_ITERATIONS=50` in the Sinas
-> deployment's environment (its `.env` for docker-compose). Sinas defaults to
-> 25 consecutive tool rounds per agent job; Grove's deep-search loop
-> (playbook → introspect → mutate → introspect … → publish) legitimately needs
-> more, and at the default the agent is killed mid-pipeline with
-> "Tool iteration limit (25) reached", leaving draft results unpublished and
-> the synthesis stage never invoked. Applies to every environment running the
-> Grove package, including the deployed one.
+> **Sinas settings required** (in the Sinas deployment's environment — its
+> `.env` for docker-compose; applies to every environment running the Grove
+> package, including the deployed one):
+>
+> - `MAX_TOOL_ITERATIONS=50` — Sinas defaults to 25 consecutive tool rounds
+>   per agent job; Grove's deep-search loop (playbook → introspect → mutate →
+>   introspect … → publish) legitimately needs more, and at the default the
+>   agent is killed mid-pipeline with "Tool iteration limit (25) reached",
+>   leaving draft results unpublished and synthesis never invoked.
+> - `FUNCTION_TIMEOUT=900` — Sinas applies this (default 300s) as the timeout
+>   for ALL tool executions, including `call_agent` sub-agent invocations.
+>   Grove's deep-search sub-agents run 5–10 minutes, so at the default the
+>   orchestrator's call times out and it re-dispatches duplicate sub-searches
+>   while the originals are still running.
+> - `AGENT_JOB_TIMEOUT=1800` — keeps sub-agent jobs alive for the longest
+>   expected deep-search run.
 
 ## Quick start (local dev)
 
