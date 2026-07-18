@@ -17,6 +17,15 @@ Grove turns unstructured documents into a structured, filterable graph and expos
 
 Grove depends on a running Sinas instance for agents, file storage, RBAC, and skills. Standalone deployment is not supported in v1.
 
+> **Sinas setting required:** set `MAX_TOOL_ITERATIONS=50` in the Sinas
+> deployment's environment (its `.env` for docker-compose). Sinas defaults to
+> 25 consecutive tool rounds per agent job; Grove's deep-search loop
+> (playbook → introspect → mutate → introspect … → publish) legitimately needs
+> more, and at the default the agent is killed mid-pipeline with
+> "Tool iteration limit (25) reached", leaving draft results unpublished and
+> the synthesis stage never invoked. Applies to every environment running the
+> Grove package, including the deployed one.
+
 ## Quick start (local dev)
 
 ```bash
