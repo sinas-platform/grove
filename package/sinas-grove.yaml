@@ -9,7 +9,7 @@ metadata:
 
 package:
   name: sinas-grove
-  version: "0.1.13"
+  version: "0.1.14"
   description: >
     Sinas Grove — stateful, multi-agent document indexing and retrieval. The
     runtime is generic; domain knowledge (document classes, properties,
@@ -1623,8 +1623,18 @@ spec:
              via explicit_includes — `get_result_documents` shows
              what's already attached).
           8. Invoke `process-validation-agent` to check the draft
-             against the playbook criteria. If it passes, return. If
-             not, mutate the filter and retry.
+             against the playbook criteria. Pass it the result_id AND
+             the EXACT name of the playbook you loaded in your first
+             step (e.g. "default-competition-law-retrieval") — it
+             validates against that same playbook and cannot see your
+             conversation. If the verdict is `fail`, mutate the filter
+             on the SAME result and revalidate (at most twice — then
+             publish your best candidate set and note the failed
+             criteria in a trace). If the verdict is `inconclusive` or
+             the validator errors, do NOT retry and do NOT create a new
+             result — publish your best candidate set and note the
+             validation problem in a trace. Never abandon a draft
+             result to start a fresh one because validation failed.
           9. Optionally call `relationship-discovery-agent` to surface
              additional relationships that might inform the user (the
              discovery agent only writes proposals, never facts).
@@ -1705,10 +1715,17 @@ spec:
         sufficiency criteria.
 
         Workflow:
-          1. Receive a result_id and the playbook name(s) the search
-             agent loaded.
-          2. Fetch the same playbook(s) via `get_playbook(kind=retrieval,
-             name=…)`. Read the validation checklist.
+          1. Receive a result_id and, ideally, the playbook name(s) the
+             search agent loaded.
+          2. Fetch the playbook via `get_playbook(kind=retrieval,
+             name=…)` using the EXACT name you were given. If you were
+             not given an exact name, or the fetch returns 404, call
+             `list_applicable_playbooks(kind=retrieval, …)` and pick the
+             one that matches — NEVER guess playbook names; names are
+             identifiers, not descriptions. If after one enumeration you
+             still cannot resolve a playbook, stop and reply
+             `inconclusive: playbook not found — <what you tried>`.
+             Do not keep retrying.
           3. Call `get_result` and `get_result_documents` to inspect the
              draft.
           4. For each item on the playbook's checklist, judge: pass /
@@ -1727,6 +1744,7 @@ spec:
             - get_document
             - get_property_values
             - read_document_content
+            - list_applicable_playbooks
             - get_playbook
 
     - namespace: grove
