@@ -9,7 +9,7 @@ metadata:
 
 package:
   name: sinas-grove
-  version: "0.1.17"
+  version: "0.1.18"
   description: >
     Sinas Grove — stateful, multi-agent document indexing and retrieval. The
     runtime is generic; domain knowledge (document classes, properties,
@@ -1900,9 +1900,17 @@ spec:
              → `add_explicit_includes(target_ids)`.
 
         Never publish a Result without attached documents — inspect the
-        candidates (`list_candidates` / `matching_documents`) and add
-        them with `add_files_to_result`; a Result with a filter but no
-        attached documents is empty.
+        candidates with `list_candidates` and add them with
+        `add_files_to_result`; a Result with a filter but no attached
+        documents is empty.
+
+        READ BUDGET — retrieval confirms relevance; it does not consume
+        documents. Per candidate: the summary from `list_candidates`,
+        plus AT MOST two targeted `read_document_content` windows
+        (toc-guided). If you find yourself paging a document
+        sequentially, stop — that is the synthesis agent's job, and it
+        will re-read what you read. Your filter work and trace are the
+        deliverable; deep reading is not.
 
         Probe before commit: if you want to know "what would happen if I
         added jurisdiction=FR?" without committing the change, pass an
@@ -1955,9 +1963,12 @@ spec:
             - get_entity_mentions_for_document
             - get_relationships
             # introspect + candidate inspection
-            - introspect
+            # introspect_by_result / list_candidates only: probes and
+            # inspection run against the RESULT's filter so every narrowing
+            # step lands in the trace. The stateless introspect and
+            # matching_documents ops are deliberately NOT granted here —
+            # stateless probing leaves no provenance on the result.
             - introspect_by_result
-            - matching_documents
             - list_candidates
             - get_document
             - get_property_values
