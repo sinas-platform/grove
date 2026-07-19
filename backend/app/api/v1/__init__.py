@@ -13,6 +13,7 @@ from app.api.v1 import (
     me,
     packages,
     playbooks,
+    query_runs,
     relationships,
     result_filter,
     results,
@@ -45,6 +46,7 @@ api_router.include_router(answers.router)
 api_router.include_router(relationships.router)
 api_router.include_router(entities.router)
 api_router.include_router(playbooks.router)
+api_router.include_router(query_runs.router)
 api_router.include_router(packages.router)
 api_router.include_router(sinas_status.router)
 api_router.include_router(uploads.router)
