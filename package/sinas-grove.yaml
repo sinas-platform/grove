@@ -845,6 +845,25 @@ spec:
               result_id: { type: string, format: uuid }
             required: [result_id]
 
+        - name: merge_results
+          method: POST
+          path: /api/v1/retrieval/results/{{ result_id }}/merge
+          parameters:
+            type: object
+            properties:
+              result_id: { type: string, format: uuid }
+              child_result_ids:
+                type: array
+                items: { type: string, format: uuid }
+            required: [result_id, child_result_ids]
+          description: |
+            Deterministically merge child results into the parent
+            `result_id`: the server copies the union of the children's
+            documents (dedup by document, provenance preserved), links each
+            child via parent_result_id, and writes a trace recording the
+            merge. Pass ONLY the child result ids — never enumerate document
+            ids yourself; the server guarantees nothing is dropped.
+
         - name: list_results
           method: GET
           path: /api/v1/results
@@ -1549,9 +1568,11 @@ spec:
              work. Only re-dispatch a sub-search when there is no
              matching result at all. Duplicate sub-searches are the
              single most expensive failure mode.
-          3. After all sub-searches complete, merge their results into a
-             single parent result. Persist the parent's
-             `parent_result_id` linkage.
+          3. After all sub-searches complete, create the parent result
+             with `create_draft_result`, then call `merge_results` with
+             the parent's id and ALL child result ids. The server copies
+             the union of the children's documents and links the
+             children — pass only result ids, never document ids.
           4. Append a final trace entry summarizing the orchestration.
           5. Call `publish_result` on the parent.
 
@@ -1561,7 +1582,7 @@ spec:
         - connector: grove/api
           operations:
             - create_draft_result
-            - add_files_to_result
+            - merge_results
             - append_trace
             - publish_result
             - get_result
