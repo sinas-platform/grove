@@ -174,6 +174,35 @@ async def add_files_to_result(
     return {"added": len(payload.document_ids), "trace_sequence": next_seq}
 
 
+class ExpandStep(BaseModel):
+    relationship: str
+    direction: str = Field(pattern="^(out|in)$")
+
+
+class ExpandResultGraphIn(BaseModel):
+    steps: list[ExpandStep] = Field(min_length=1, max_length=4)
+
+
+@router.post(
+    "/results/{result_id}/expand",
+    dependencies=[Depends(require_permission("grove.results.write:own"))],
+)
+async def expand_result_graph(
+    result_id: uuid.UUID,
+    payload: ExpandResultGraphIn,
+    session: AsyncSession = Depends(get_session),
+    caller: CallerIdentity = Depends(get_caller),
+):
+    """Caller-declared deterministic graph expansion — see
+    services.result_filter.expand_result_graph."""
+    from app.services.result_filter import expand_result_graph as svc
+
+    return await svc(
+        session, caller, result_id,
+        steps=[st.model_dump() for st in payload.steps],
+    )
+
+
 class MergeResultsIn(BaseModel):
     child_result_ids: list[uuid.UUID] = Field(min_length=1)
 
