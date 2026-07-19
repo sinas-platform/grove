@@ -559,6 +559,92 @@ async def replace_filter(
 # ───────────────────────────── draft-result document ops ─────────────────────────────
 
 
+async def merge_results(
+    session: AsyncSession,
+    caller: CallerIdentity,
+    parent_id: uuid.UUID,
+    child_result_ids: list[uuid.UUID],
+) -> dict:
+    """Merge child results into a parent, deterministically.
+
+    Copies the union of the children's documents onto the parent (dedup by
+    document_id, first-seen child wins), preserves per-document provenance
+    (each copied row's reason records the source child), sets
+    `parent_result_id` on every child, and writes a server-enforced trace on
+    the parent recording exactly what was merged. Exists so an orchestrating
+    agent never shuttles document-id lists through its own context — an LLM
+    copy can silently drop rows; this cannot.
+    """
+    parent = await load_visible_result(session, caller, parent_id, for_write=True)
+
+    existing: set[uuid.UUID] = set(
+        (
+            await session.execute(
+                select(ResultDocument.document_id).where(
+                    ResultDocument.result_id == parent_id
+                )
+            )
+        ).scalars()
+    )
+
+    per_child: dict[str, dict[str, int]] = {}
+    for child_id in child_result_ids:
+        if child_id == parent_id:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, "a result cannot be merged into itself"
+            )
+        child = await load_visible_result(session, caller, child_id, for_write=False)
+        rows = (
+            await session.execute(
+                select(ResultDocument)
+                .where(ResultDocument.result_id == child_id)
+                .order_by(ResultDocument.rank.nulls_last())
+            )
+        ).scalars().all()
+        added = 0
+        for rd in rows:
+            if rd.document_id in existing:
+                continue
+            existing.add(rd.document_id)
+            session.add(
+                ResultDocument(
+                    result_id=parent_id,
+                    document_id=rd.document_id,
+                    document_version_id=rd.document_version_id,
+                    rank=None,
+                    reason=f"[merged from result {child_id}] {rd.reason or ''}".strip(),
+                    added_by_agent=rd.added_by_agent,
+                )
+            )
+            added += 1
+        per_child[str(child_id)] = {"documents": len(rows), "added": added}
+        child.parent_result_id = parent_id
+
+    next_seq = await _next_trace_sequence(session, parent_id)
+    session.add(
+        ResultTrace(
+            result_id=parent_id,
+            sequence=next_seq,
+            agent=AUTO_TRACE_AGENT,
+            action="merge_results",
+            parameters={"child_result_ids": [str(c) for c in child_result_ids]},
+            outcome={
+                "per_child": per_child,
+                "total_documents": len(existing),
+            },
+            occurred_at=datetime.now(timezone.utc),
+        )
+    )
+    await session.commit()
+    _ = parent
+    return {
+        "parent_result_id": parent_id,
+        "total_documents": len(existing),
+        "per_child": per_child,
+        "trace_sequence": next_seq,
+    }
+
+
 async def remove_files_from_result(
     session: AsyncSession,
     caller: CallerIdentity,

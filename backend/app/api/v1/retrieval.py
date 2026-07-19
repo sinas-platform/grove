@@ -12,7 +12,7 @@ from __future__ import annotations
 import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import CallerIdentity, get_caller, require_permission
@@ -148,6 +148,28 @@ async def add_files_to_result(
         )
     await session.commit()
     return {"added": len(payload.document_ids)}
+
+
+class MergeResultsIn(BaseModel):
+    child_result_ids: list[uuid.UUID] = Field(min_length=1)
+
+
+@router.post(
+    "/results/{result_id}/merge",
+    dependencies=[Depends(require_permission("grove.results.write:own"))],
+)
+async def merge_results(
+    result_id: uuid.UUID,
+    payload: MergeResultsIn,
+    session: AsyncSession = Depends(get_session),
+    caller: CallerIdentity = Depends(get_caller),
+):
+    """Deterministically merge child results into this parent: union of the
+    children's documents (dedup, provenance preserved), child linkage, and a
+    server-enforced trace. See services.result_filter.merge_results."""
+    from app.services.result_filter import merge_results as merge_results_svc
+
+    return await merge_results_svc(session, caller, result_id, payload.child_result_ids)
 
 
 @router.post(
