@@ -40,6 +40,7 @@ def _launch(run_id: uuid.UUID) -> None:
 class QueryRunIn(BaseModel):
     question: str = Field(min_length=8)
     mode: str = Field(default="full", pattern="^(full|retrieval|synthesis)$")
+    effort: str = Field(default="medium", pattern="^(low|medium|high)$")
     subqueries: list[str] | None = None  # skip decomposition when provided
     # required for mode="synthesis": the published result to answer from
     parent_result_id: uuid.UUID | None = None
@@ -49,6 +50,7 @@ class QueryRunIn(BaseModel):
 class QueryRunOut(OwnedOut):
     question: str
     mode: str = "full"
+    effort: str = "medium"
     status: str
     subqueries: list[str] | None = None
     parent_result_id: uuid.UUID | None = None
@@ -75,6 +77,7 @@ async def create_query_run(
     run = QueryRun(
         question=payload.question,
         mode=payload.mode,
+        effort=payload.effort,
         subqueries=payload.subqueries,
         parent_result_id=payload.parent_result_id,
         run_discovery=payload.run_discovery,

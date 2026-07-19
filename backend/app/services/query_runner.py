@@ -42,6 +42,9 @@ MAX_NUDGES = 2
 MAX_VALIDATE_ROUNDS = 3
 REMEDIATION_WINDOW_S = 8 * 60
 MIN_CLAIMS = 6
+# effort → maximum sub-query fan-out. The bound is enforced here (truncation)
+# AND stated in the decompose instruction; no magic numbers in agent prose.
+EFFORT_FANOUT = {"low": 1, "medium": 2, "high": 3}
 
 _log = __import__("logging").getLogger("grove.query_runner")
 
@@ -158,13 +161,16 @@ async def _stage_decompose(run_id: uuid.UUID, sinas: _Sinas) -> list[str]:
         if run.subqueries:
             return list(run.subqueries)
         question = run.question
+        max_fanout = EFFORT_FANOUT.get(run.effort, 2)
     await _mark(run_id, status="decomposing")
-    await _tele(run_id, "decompose", started=_iso())
+    await _tele(run_id, "decompose", started=_iso(), max_fanout=max_fanout)
     reply = await sinas.invoke(
         "grove/search-orchestrator",
-        "Decompose the following question into independent retrieval sub-queries "
-        "(1 if single-shot, 2-3 if comparative or multi-part). Reply with ONLY a "
-        f"JSON array of strings.\n\nQuestion: {question}",
+        "Decompose the following question into independent retrieval sub-queries. "
+        f"Use AT MOST {max_fanout} sub-quer{'y' if max_fanout == 1 else 'ies'}; "
+        "fewer is better when the question does not demand parallel angles. "
+        "Reply with ONLY a JSON array of strings.\n\n"
+        f"Question: {question}",
     )
     try:
         cleaned = reply.strip().strip("`")
@@ -173,6 +179,7 @@ async def _stage_decompose(run_id: uuid.UUID, sinas: _Sinas) -> list[str]:
         assert isinstance(subs, list) and subs and all(isinstance(x, str) for x in subs)
     except Exception:
         subs = [question]
+    subs = subs[:max_fanout]
     await _mark(run_id, subqueries=subs)
     await _tele(run_id, "decompose", completed=_iso(), subqueries=subs)
     return subs

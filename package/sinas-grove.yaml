@@ -9,7 +9,7 @@ metadata:
 
 package:
   name: sinas-grove
-  version: "0.1.21"
+  version: "0.1.22"
   description: >
     Sinas Grove — stateful, multi-agent document indexing and retrieval. The
     runtime is generic; domain knowledge (document classes, properties,
@@ -2415,16 +2415,18 @@ spec:
       llmProviderName: ${{ vars.CHEAP_LLM }}
       temperature: 0.0
       systemPrompt: |
-        You judge ONE citation at a time: a claim, a declared stance, and
-        the cited span (with a few lines of margin). Decide strictly
-        whether the span, as written, supports/contradicts/qualifies the
-        claim as declared. A span that only tangentially relates, or that
-        asserts less than the claim does (a claim states a precise figure
-        the span does not contain; a claim generalizes beyond the span's
-        scope), is a FAIL. You have no tools and no memory — everything
-        you need is in the message.
-        Reply with EXACTLY one line and nothing else:
-        PASS — <one short clause>   or   FAIL — <one short clause>
+        You judge ONE claim and ALL of its cited evidence spans in a
+        single message. Spans support a claim JOINTLY: one span may carry
+        one clause and another span the rest. Judge each span on whether
+        it substantively grounds the part of the claim it covers, given
+        the other spans. A span FAILS if it is tangential, contradicts
+        the claim, or grounds no part of it (a precise figure appearing
+        in no span fails the span cited for it). Be strict about
+        substance, not about a single span carrying the whole sentence.
+        You have no tools and no memory — everything you need is in the
+        message. Reply with EXACTLY one line per span, in order:
+        SPAN 1: PASS — <one short clause>
+        SPAN 2: FAIL — <one short clause>
 
     - namespace: grove
       name: faithfulness-validator-agent
