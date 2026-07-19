@@ -240,6 +240,28 @@ async def delete_claim(
     await session.commit()
 
 
+class ValidateAnswerIn(BaseModel):
+    pending_only: bool = True
+
+
+@router.post(
+    "/answers/{answer_id}/validate",
+    dependencies=[Depends(require_permission("grove.answers.write:own"))],
+)
+async def validate_answer_evidence(
+    answer_id: uuid.UUID,
+    payload: ValidateAnswerIn,
+    session: AsyncSession = Depends(get_session),
+    caller: CallerIdentity = Depends(get_caller),
+):
+    """Judge the answer's (pending) evidence rows as parallel stateless
+    LLM calls and record verdicts — see services.faithfulness."""
+    from app.services.faithfulness import validate_answer_evidence as svc
+
+    await _writable_answer_or_404(answer_id, session, caller)
+    return await svc(session, caller, answer_id, pending_only=payload.pending_only)
+
+
 class ValidationVerdict(BaseModel):
     validated: bool
     reasoning: str
