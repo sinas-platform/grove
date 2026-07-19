@@ -39,7 +39,7 @@ SEARCH_TIMEOUT_S = 25 * 60
 DRAFT_TIMEOUT_S = 20 * 60
 IDLE_DEAD_S = 150
 MAX_NUDGES = 2
-MAX_VALIDATE_ROUNDS = 3
+MAX_VALIDATE_ROUNDS = 4
 REMEDIATION_WINDOW_S = 8 * 60
 MIN_CLAIMS = 6
 # effort → maximum sub-query fan-out. The bound is enforced here (truncation)
@@ -429,8 +429,17 @@ async def _stage_validate_publish(run_id: uuid.UUID, sinas: _Sinas) -> None:
         answer_id, chat_id = run.answer_id, run.synthesis_chat_id
         caller = _runner_caller(run)
 
+    async def _await_chat_quiescence() -> None:
+        """Never judge while the drafter is mid-write: require the synthesis
+        chat to be continuously idle for IDLE_DEAD_S before proceeding (run 10
+        failed on exactly this race — a validate round judged mid-remediation
+        and the late resets had no round left)."""
+        while not await _chat_is_idle(sinas, chat_id):
+            await asyncio.sleep(POLL_S)
+
     await _mark(run_id, status="validating")
     for round_no in range(1, MAX_VALIDATE_ROUNDS + 1):
+        await _await_chat_quiescence()
         async with AsyncSessionLocal() as session:
             verdict = await validate_answer_evidence(session, caller, answer_id, pending_only=True)
         await _tele(run_id, "validate", **{f"round_{round_no}": {
@@ -470,13 +479,14 @@ async def _stage_validate_publish(run_id: uuid.UUID, sinas: _Sinas) -> None:
             "publish yourself:\n" + failures,
         )
         t0 = asyncio.get_event_loop().time()
+        saw_activity = False
         while asyncio.get_event_loop().time() - t0 < REMEDIATION_WINDOW_S:
             await asyncio.sleep(POLL_S)
-            if (
-                asyncio.get_event_loop().time() - t0 > 60
-                and await _chat_is_idle(sinas, chat_id)
-            ):
-                break
+            idle = await _chat_is_idle(sinas, chat_id)
+            if not idle:
+                saw_activity = True
+            elif saw_activity:
+                break  # worked, then went quiet — remediation done
     raise RuntimeError("validation did not converge within round budget")
 
 
