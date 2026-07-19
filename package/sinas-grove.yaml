@@ -9,7 +9,7 @@ metadata:
 
 package:
   name: sinas-grove
-  version: "0.1.20"
+  version: "0.1.21"
   description: >
     Sinas Grove — stateful, multi-agent document indexing and retrieval. The
     runtime is generic; domain knowledge (document classes, properties,
@@ -1808,7 +1808,11 @@ spec:
 
         Loop:
           1. Call `create_draft_result` with the query. You receive
-             `result_id` and `filter_version=0`.
+             `result_id` and `filter_version=0`. Create exactly ONE
+             result for your sub-query — probe freely with the
+             stateless `introspect`/`matching_documents`, but commit
+             everything to this single result; never create scratch
+             results.
           1.5. One-time orientation: call `get_document_classes` (and
              `get_dossier_classes` if dossiers are configured) to see
              what kinds of documents exist. Pick a class that matches
@@ -1988,11 +1992,16 @@ spec:
             - get_entity_mentions_for_document
             - get_relationships
             # introspect + candidate inspection
-            # introspect_by_result / list_candidates only: probes and
-            # inspection run against the RESULT's filter so every narrowing
-            # step lands in the trace. The stateless introspect and
-            # matching_documents ops are deliberately NOT granted here —
-            # stateless probing leaves no provenance on the result.
+            # Stateless probes (introspect, matching_documents) are allowed:
+            # exploration is cheap and disposable BY DESIGN. Provenance is
+            # enforced at the COMMITMENT layer instead — every filter
+            # mutation, attach, and publish on the result auto-traces, and
+            # publish records filter coverage. (Removing the stateless ops
+            # was tried in 0.1.18 and backfired: agents created disposable
+            # scratch RESULTS to probe with — worse cost and worse
+            # provenance.)
+            - introspect
+            - matching_documents
             - introspect_by_result
             - list_candidates
             - get_document
