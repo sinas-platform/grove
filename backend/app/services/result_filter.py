@@ -755,6 +755,155 @@ async def merge_results(
     }
 
 
+async def expand_result_graph(
+    session: AsyncSession,
+    caller: CallerIdentity,
+    result_id: uuid.UUID,
+    steps: list[dict],
+) -> dict:
+    """Deterministically expand a result along a caller-declared edge path.
+
+    `steps` is an ordered list of {"relationship": <definition name>,
+    "direction": "out"|"in"}. Starting from the result's attached documents,
+    each step follows edges of that definition (out: source→target, in:
+    target→source). Whatever documents the final frontier contains (visible
+    to the caller, not yet attached) are attached with per-origin provenance,
+    and the walk is recorded in one enforced trace.
+
+    Grove supplies the mechanics only. WHICH edges mean what — citation,
+    full-text, appeal chains — is domain knowledge: the calling agent reads
+    the available definitions (get_relationship_definitions) and its playbook,
+    and declares the path. Replaces per-hop agentic traversal (measured at
+    ~30 get_relationships turns per question).
+    """
+    from app.models import Document, RelationshipDefinition
+    from app.models.runtime import Relationship
+    from app.services.visibility import visible_clause as _vc
+
+    if not steps or len(steps) > 4:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, "steps must contain 1-4 path steps"
+        )
+    defs_by_name: dict[str, uuid.UUID] = dict(
+        (
+            await session.execute(
+                select(RelationshipDefinition.name, RelationshipDefinition.id).where(
+                    RelationshipDefinition.name.in_([st.get("relationship") for st in steps])
+                )
+            )
+        ).all()
+    )
+    for st in steps:
+        if st.get("relationship") not in defs_by_name:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND,
+                f"unknown relationship definition: {st.get('relationship')!r}",
+            )
+        if st.get("direction") not in ("out", "in"):
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, "direction must be 'out' or 'in'"
+            )
+
+    await load_visible_result(session, caller, result_id, for_write=True)
+    attached: set[uuid.UUID] = set(
+        (
+            await session.execute(
+                select(ResultDocument.document_id).where(
+                    ResultDocument.result_id == result_id
+                )
+            )
+        ).scalars()
+    )
+    if not attached:
+        return {"added": 0, "frontiers": [], "total_documents": 0}
+
+    # origin[node] = the attached document this frontier node descends from
+    origin: dict[uuid.UUID, uuid.UUID] = {d: d for d in attached}
+    frontier: set[uuid.UUID] = set(attached)
+    frontier_sizes: list[int] = []
+    for st in steps:
+        def_id = defs_by_name[st["relationship"]]
+        src_col, dst_col = (
+            (Relationship.source_id, Relationship.target_id)
+            if st["direction"] == "out"
+            else (Relationship.target_id, Relationship.source_id)
+        )
+        edges = (
+            await session.execute(
+                select(src_col, dst_col)
+                .where(Relationship.relationship_definition_id == def_id)
+                .where(src_col.in_(frontier))
+            )
+        ).all()
+        next_frontier: set[uuid.UUID] = set()
+        for src, dst in edges:
+            next_frontier.add(dst)
+            origin.setdefault(dst, origin.get(src, src))
+        frontier = next_frontier
+        frontier_sizes.append(len(frontier))
+        if not frontier:
+            break
+
+    read_all = await caller.has_permission("grove.documents.read:all")
+    reachable_docs = set(
+        (
+            await session.execute(
+                select(Document.id)
+                .where(Document.id.in_(frontier))
+                .where(_vc(Document, caller, read_all=read_all))
+            )
+        ).scalars()
+    ) if frontier else set()
+
+    filenames: dict[uuid.UUID, str] = dict(
+        (
+            await session.execute(
+                select(Document.id, Document.filename).where(
+                    Document.id.in_(attached | reachable_docs)
+                )
+            )
+        ).all()
+    )
+    path_str = " → ".join(f"{st['relationship']}({st['direction']})" for st in steps)
+    added = 0
+    for doc_id in reachable_docs - attached:
+        attached.add(doc_id)
+        org = origin.get(doc_id)
+        session.add(
+            ResultDocument(
+                result_id=result_id,
+                document_id=doc_id,
+                reason=f"graph expansion [{path_str}] from {filenames.get(org, org)}",
+                added_by_agent="grove/expand-result-graph",
+            )
+        )
+        added += 1
+
+    next_seq = await _next_trace_sequence(session, result_id)
+    session.add(
+        ResultTrace(
+            result_id=result_id,
+            sequence=next_seq,
+            agent=AUTO_TRACE_AGENT,
+            action="expand_result_graph",
+            parameters={"steps": steps},
+            outcome={
+                "frontier_sizes": frontier_sizes,
+                "added": added,
+                "total_documents": len(attached),
+            },
+            occurred_at=datetime.now(timezone.utc),
+        )
+    )
+    await session.commit()
+    return {
+        "added": added,
+        "frontiers": frontier_sizes,
+        "total_documents": len(attached),
+        "trace_sequence": next_seq,
+    }
+
+
 async def remove_files_from_result(
     session: AsyncSession,
     caller: CallerIdentity,

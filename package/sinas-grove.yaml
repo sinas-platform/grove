@@ -9,7 +9,7 @@ metadata:
 
 package:
   name: sinas-grove
-  version: "0.1.22"
+  version: "0.1.23"
   description: >
     Sinas Grove — stateful, multi-agent document indexing and retrieval. The
     runtime is generic; domain knowledge (document classes, properties,
@@ -990,6 +990,35 @@ spec:
               result_id: { type: string, format: uuid }
             required: [result_id]
 
+        - name: expand_result_graph
+          method: POST
+          path: /api/v1/retrieval/results/{{ result_id }}/expand
+          parameters:
+            type: object
+            properties:
+              result_id: { type: string, format: uuid }
+              steps:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    relationship: { type: string }
+                    direction: { type: string, enum: [out, in] }
+                  required: [relationship, direction]
+            required: [result_id, steps]
+          description: |
+            Deterministically expand the result along a path of relationship
+            edges YOU declare. Starting from the attached documents, each
+            step follows edges of the named relationship definition (out:
+            source→target, in: target→source); documents in the final
+            frontier are attached with per-origin provenance and one trace.
+            Read `get_relationship_definitions` (and your playbook) to know
+            which edges exist and what path expresses the expansion you
+            want, then make ONE call — never traverse `get_relationships`
+            hop by hop. Example: citations to full texts is
+            steps=[{relationship: "cites", direction: "out"},
+                   {relationship: "is_full_text_of", direction: "in"}].
+
         - name: merge_results
           method: POST
           path: /api/v1/retrieval/results/{{ result_id }}/merge
@@ -1923,10 +1952,12 @@ spec:
           c. For multi-entity questions ("involving Authority A AND
              Article 101"), call `set_entity_filter` once per
              `entity_type_id` slot — slots AND together.
-          d. To follow citation chains: for each surviving doc, call
-             `get_relationships(source_id=doc_id,
-             relationship_definition_id=<cites>)` → collect target_ids
-             → `add_explicit_includes(target_ids)`.
+          d. To follow citation chains: after attaching your secondary
+             set, declare the path once to `expand_result_graph` (see
+             the tool description; your playbook names the relevant
+             relationship definitions). The server walks every edge and
+             attaches the reachable documents with provenance. Never
+             traverse `get_relationships` hop by hop.
 
         Never publish a Result without attached documents — inspect the
         candidates with `list_candidates` and add them with
@@ -2010,6 +2041,7 @@ spec:
             # result lifecycle
             - create_draft_result
             - add_files_to_result
+            - expand_result_graph
             - remove_files_from_result
             - clear_result_files
             - append_trace
