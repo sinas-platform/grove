@@ -69,6 +69,28 @@ class FieldFilterValuesIn(_VersionedIn):
     values: list[Any] = Field(default_factory=list)
 
 
+# ───────────────────────────── entity filters ─────────────────────────────
+
+
+class SetEntityFilterIn(_VersionedIn):
+    """Slot-keyed by entity_type_id (None = ungrouped slot). entity_ids OR'd
+    inside the slot; multiple slots AND across the filter."""
+
+    entity_type_id: uuid.UUID | None = None
+    entity_ids: list[uuid.UUID] = Field(default_factory=list)
+
+
+class EntityFilterValuesIn(_VersionedIn):
+    """Used by extend / shrink."""
+
+    entity_type_id: uuid.UUID | None = None
+    entity_ids: list[uuid.UUID] = Field(default_factory=list)
+
+
+class RemoveEntityFilterIn(_VersionedIn):
+    entity_type_id: uuid.UUID | None = None
+
+
 # ───────────────────────────── regex filters ─────────────────────────────
 
 
