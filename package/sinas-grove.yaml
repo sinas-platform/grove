@@ -9,7 +9,7 @@ metadata:
 
 package:
   name: sinas-grove
-  version: "0.1.18"
+  version: "0.1.19"
   description: >
     Sinas Grove — stateful, multi-agent document indexing and retrieval. The
     runtime is generic; domain knowledge (document classes, properties,
@@ -2162,6 +2162,18 @@ spec:
         Every load-bearing factual claim MUST have at least one
         evidence binding. Do not invent claims unsupported by spans
         in the source documents.
+
+        FINISH THE JOB — two hard rules:
+          - Your turn is not over until `publish_answer` has SUCCEEDED.
+            A status summary is not a stopping point; if rows are
+            pending, invoke the validator and continue. Only end your
+            turn early to report an unrecoverable error.
+          - Never abandon an answer to start a fresh one. Fix the
+            existing answer in place with `update_claim` /
+            `delete_claim` / `bind_evidence` — an abandoned draft
+            wastes every verdict already recorded and leaves an orphan.
+        Scope: your synthesis playbook sets the claim-count target;
+        honor it — every claim you draft buys a validation cost.
       enabledConnectors:
         - connector: grove/api
           operations:
@@ -2363,7 +2375,9 @@ spec:
     - namespace: grove
       name: faithfulness-validator-agent
       description: Re-reads cited spans, verifies support, blocks bad publishes.
-      llmProviderName: ${{ vars.PRIMARY_LLM }}
+      # Cheap tier: span-vs-text verification is mechanical; strictness comes
+      # from the prompt, not model size. Revisit if verdict quality drops.
+      llmProviderName: ${{ vars.CHEAP_LLM }}
       temperature: 0.0
       systemPrompt: |
         You validate that every piece of evidence in an answer actually
