@@ -18,6 +18,7 @@ from app.models.discovery import (
     DiscoveryRunUnit,
 )
 from app.models.ingestion import IngestionRun, IngestionRunUnit
+from app.models.query import QueryRun
 from app.models.runtime import (
     Answer,
     AnswerClaim,
@@ -74,6 +75,7 @@ __all__ = [
     "DossierPropertyValue",
     "DossierDocument",
     "IngestionRun",
+    "QueryRun",
     "IngestionRunUnit",
     "DiscoveryRun",
     "DiscoveryRunUnit",
