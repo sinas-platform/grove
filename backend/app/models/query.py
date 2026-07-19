@@ -44,6 +44,12 @@ class QueryRun(Base, TimestampMixin, OwnedMixin):
     mode: Mapped[str] = mapped_column(
         String(20), nullable=False, default="full", server_default="full"
     )
+    # How expansive the run may be; the runner translates this into hard
+    # bounds (sub-query fan-out today; read depth is a candidate later).
+    # low=1 sub-query, medium=2, high=3.
+    effort: Mapped[str] = mapped_column(
+        String(10), nullable=False, default="medium", server_default="medium"
+    )
     status: Mapped[str] = mapped_column(
         String(20), nullable=False, default="pending", server_default="pending"
     )

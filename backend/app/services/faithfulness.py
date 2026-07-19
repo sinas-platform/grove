@@ -38,18 +38,26 @@ _VALIDATOR_AGENT = "grove/evidence-check-agent"
 
 _PROMPT = """CLAIM: {claim}
 
-DECLARED STANCE: the cited span {stance_desc}.
+The claim cites {n} evidence span(s). Spans support a claim JOINTLY — one
+span may carry one clause of the claim and another span the rest. Judge each
+span on whether it substantively supports the part of the claim it covers,
+given the other spans.
 
-CITED SPAN (lines {line_from}-{line_to} of the source document, with margin):
+{spans_block}
+
+A span FAILS if it is only tangentially related, contradicts the claim, or
+covers no part of it (e.g. the claim's precise figure appears in no span).
+A span PASSES if it substantively grounds a part of the claim, even if other
+parts are grounded by the other spans.
+Reply with exactly one line PER SPAN, in order, nothing else:
+SPAN 1: PASS — <one short clause>
+SPAN 2: FAIL — <one short clause>
+..."""
+
+_SPAN_TMPL = """SPAN {i} (stance: {stance}; lines {line_from}-{line_to}):
 ---
 {span_text}
----
-
-Does the span, as written, {stance_verb} the claim? Judge strictly: a span
-that only tangentially relates, or asserts less than the claim does
-(e.g. the claim states a precise figure the span does not contain), is a FAIL.
-Reply with exactly one line:
-PASS — <one short clause> | or | FAIL — <one short clause>"""
+---"""
 
 _STANCES = {
     "supports": ("is claimed to SUPPORT the claim", "support"),
@@ -69,48 +77,53 @@ def _slice_span(content_md: str, span: dict[str, Any]) -> tuple[str, int, int]:
     return text, line_from, line_to
 
 
-async def _judge_one(
+async def _judge_claim(
     client: httpx.AsyncClient,
     sem: asyncio.Semaphore,
     settings,
-    row: ClaimEvidence,
     claim_text: str,
-    span_text: str,
-    line_from: int,
-    line_to: int,
-) -> dict[str, Any]:
-    stance_desc, stance_verb = _STANCES.get(row.stance, _STANCES["supports"])
-    prompt = _PROMPT.format(
-        claim=claim_text,
-        stance_desc=stance_desc,
-        stance_verb=stance_verb,
-        line_from=line_from,
-        line_to=line_to,
-        span_text=span_text,
+    rows: list[tuple[ClaimEvidence, str, int, int]],
+) -> list[dict[str, Any]]:
+    """One judging call for a claim and ALL its spans; per-span verdicts."""
+    spans_block = "\n\n".join(
+        _SPAN_TMPL.format(i=i + 1, stance=ev.stance, line_from=lf, line_to=lt, span_text=txt)
+        for i, (ev, txt, lf, lt) in enumerate(rows)
     )
+    prompt = _PROMPT.format(claim=claim_text, n=len(rows), spans_block=spans_block)
     async with sem:
         try:
             resp = await client.post(
                 f"{settings.sinas_url}/agents/{_VALIDATOR_AGENT}/invoke",
                 headers={"Authorization": f"Bearer {settings.sinas_api_key}"},
                 json={"message": prompt},
-                timeout=90.0,
+                timeout=120.0,
             )
             resp.raise_for_status()
             reply = (resp.json().get("reply") or "").strip()
-        except Exception as exc:  # judged rows stay pending on transport errors
-            return {"evidence_id": row.id, "error": f"invoke failed: {exc}"}
+        except Exception as exc:
+            return [{"evidence_id": ev.id, "error": f"invoke failed: {exc}"} for ev, *_ in rows]
 
-    first = reply.splitlines()[0].strip() if reply else ""
-    upper = first.upper()
-    if upper.startswith("PASS"):
-        validated = True
-    elif upper.startswith("FAIL"):
-        validated = False
-    else:
-        return {"evidence_id": row.id, "error": f"unparseable verdict: {first[:80]}"}
-    reasoning = first.split("—", 1)[1].strip() if "—" in first else first
-    return {"evidence_id": row.id, "validated": validated, "reasoning": reasoning[:500]}
+    verdicts: list[dict[str, Any]] = []
+    lines = [l.strip() for l in reply.splitlines() if l.strip()]
+    for i, (ev, *_rest) in enumerate(rows):
+        line = next((l for l in lines if l.upper().startswith(f"SPAN {i + 1}:")), None)
+        if line is None:
+            verdicts.append({"evidence_id": ev.id, "error": f"no verdict line for span {i + 1}"})
+            continue
+        body = line.split(":", 1)[1].strip()
+        upper = body.upper()
+        if upper.startswith("PASS"):
+            ok = True
+        elif upper.startswith("FAIL"):
+            ok = False
+        else:
+            verdicts.append({"evidence_id": ev.id, "error": f"unparseable: {body[:60]}"})
+            continue
+        reason = body.split("—", 1)[1].strip() if "—" in body else (
+            body.split("-", 1)[1].strip() if "-" in body else body
+        )
+        verdicts.append({"evidence_id": ev.id, "validated": ok, "reasoning": reason[:500]})
+    return verdicts
 
 
 async def validate_answer_evidence(
@@ -159,19 +172,22 @@ async def validate_answer_evidence(
         return version_cache[vid]
 
     sem = asyncio.Semaphore(_MAX_CONCURRENCY)
-    tasks = []
     errors: list[dict[str, Any]] = []
+    by_claim: dict[uuid.UUID, dict[str, Any]] = {}
+    for ev, claim in rows:
+        content = await _content_for(ev)
+        if not content:
+            errors.append({"evidence_id": ev.id, "error": "no extracted content"})
+            continue
+        span_text, lf, lt = _slice_span(content, ev.span or {})
+        entry = by_claim.setdefault(claim.id, {"claim_text": claim.claim_text, "rows": []})
+        entry["rows"].append((ev, span_text, lf, lt))
     async with httpx.AsyncClient() as client:
-        for ev, claim in rows:
-            content = await _content_for(ev)
-            if not content:
-                errors.append({"evidence_id": ev.id, "error": "no extracted content"})
-                continue
-            span_text, lf, lt = _slice_span(content, ev.span or {})
-            tasks.append(
-                _judge_one(client, sem, settings, ev, claim.claim_text, span_text, lf, lt)
-            )
-        verdicts = await asyncio.gather(*tasks) if tasks else []
+        grouped = await asyncio.gather(*[
+            _judge_claim(client, sem, settings, e["claim_text"], e["rows"])
+            for e in by_claim.values()
+        ]) if by_claim else []
+    verdicts = [v for group in grouped for v in group]
 
     by_id = {ev.id: ev for ev, _ in rows}
     claims_by_ev = {ev.id: c for ev, c in rows}
