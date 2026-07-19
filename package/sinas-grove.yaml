@@ -9,7 +9,7 @@ metadata:
 
 package:
   name: sinas-grove
-  version: "0.1.16"
+  version: "0.1.17"
   description: >
     Sinas Grove — stateful, multi-agent document indexing and retrieval. The
     runtime is generic; domain knowledge (document classes, properties,
@@ -1202,6 +1202,35 @@ spec:
             you have judged a batch. All-or-nothing: every evidence_id must
             belong to the answer or the whole batch is rejected.
 
+        - name: update_claim
+          method: PATCH
+          path: /api/v1/synthesis/claims/{{ claim_id }}
+          parameters:
+            type: object
+            properties:
+              claim_id: { type: string, format: uuid }
+              claim_text: { type: string }
+              claim_type: { type: string }
+            required: [claim_id, claim_text]
+          description: |
+            Rewrite a claim's text — the remedy when validation shows the
+            claim asserts more than its spans support. Weaken the claim to
+            what the evidence actually says. Bound evidence stays but is
+            reset to unvalidated (verdicts were against the old text).
+
+        - name: delete_claim
+          method: DELETE
+          path: /api/v1/synthesis/claims/{{ claim_id }}
+          parameters:
+            type: object
+            properties:
+              claim_id: { type: string, format: uuid }
+            required: [claim_id]
+          description: |
+            Drop a claim and its evidence bindings — the remedy when no span
+            in the corpus can support it (e.g. the figure is redacted in the
+            source). Removing an unsupportable claim unblocks publishing.
+
         - name: publish_answer
           method: POST
           path: /api/v1/synthesis/answers/{{ answer_id }}/publish
@@ -1219,12 +1248,17 @@ spec:
             type: object
             properties:
               answer_id: { type: string, format: uuid }
+              pending_only: { type: boolean, default: false }
             required: [answer_id]
           description: |
             Every claim of the answer with its evidence rows nested, in one
             call — use this instead of `get_answer_claims` followed by one
             `get_claim_evidence` call per claim. Each evidence row carries
             its `id`, span, stance, and `validated` flag.
+            Enumerate the FULL set once at the start; for every later
+            progress re-check pass `pending_only=true` — it returns only the
+            still-unvalidated rows, so the response shrinks toward empty
+            instead of re-paying the full payload each round.
 
         - name: get_answer_claims
           method: GET
@@ -1875,6 +1909,18 @@ spec:
         `overlay` to `introspect_by_result` — it's read-only and not
         persisted.
 
+        PREFER STRUCTURE OVER TEXT. When the question constrains time, a
+        category, an actor, or an outcome, check the introspect
+        distributions for a well-populated property that encodes that
+        constraint and use a field filter (`set_field_filter`, range ops
+        `gte`/`lte` for date windows) BEFORE reaching for text search.
+        Structural filters are exact, cheap to re-apply, and visible in
+        the trace; text matching is the fallback for what the schema
+        does not encode. Identifier-like properties are already hidden
+        from distributions — what you see there is usable facet
+        material. The playbook tells you which properties matter for
+        this domain.
+
         Work economically — every turn re-sends your whole conversation:
           - BATCH independent tool calls in a single turn. Reading four
             candidate documents is ONE turn with four parallel
@@ -2085,8 +2131,22 @@ spec:
                   presenting contrasting evidence.
           6. Invoke `faithfulness-validator-agent` on the answer.
           7. If the validator passes all evidence, call
-             `publish_answer`. Otherwise, revise the offending claims
-             or evidence and revalidate.
+             `publish_answer`. Otherwise apply the TWO-STRIKES rule per
+             claim:
+               - First failure: EITHER bind one better span via
+                 `bind_evidence`, OR weaken the claim with
+                 `update_claim` to assert only what the spans actually
+                 say. Weakening is usually right when the span exists
+                 but says less than the claim (approximate instead of
+                 exact figures, "substantial decline" instead of a
+                 redacted percentage).
+               - Second failure of the same claim: stop binding
+                 evidence. `update_claim` it down to what IS supported,
+                 or `delete_claim` if nothing in the corpus can support
+                 it (e.g. the figure is redacted in the source).
+             Never bind a third round of evidence to the same failing
+             claim. A shorter, fully-grounded answer beats a longer one
+             stuck in validation.
 
         Every load-bearing factual claim MUST have at least one
         evidence binding. Do not invent claims unsupported by spans
@@ -2097,6 +2157,9 @@ spec:
             - start_answer
             - draft_claim
             - bind_evidence
+            - update_claim
+            - delete_claim
+            - get_answer_evidence
             - publish_answer
             - get_result
             - get_result_documents
@@ -2297,10 +2360,14 @@ spec:
 
         Workflow:
           1. Receive an answer_id.
-          2. Call `get_answer_evidence(answer_id)` — ONE call that returns
+          2. Call `get_answer_evidence(answer_id)` ONCE with no flags —
              every claim with its evidence rows nested. Each evidence row
              has an `id` and a `validated` flag. Enumerate the evidence
              yourself; do not rely on ids passed in the invocation message.
+             NEVER re-call the full enumeration afterwards: for progress
+             re-checks (e.g. after recording a batch) call
+             `get_answer_evidence(answer_id, pending_only=true)` — it
+             returns only the still-unvalidated rows.
           3. For each evidence row not already `validated: true`:
               a. Read the cited span via `read_document_content` (use the
                  span's line_from/line_to). Spans in the same document can
@@ -2311,9 +2378,13 @@ spec:
                  declared stance. Note the verdict; don't record it yet.
           4. Record all verdicts in ONE `record_validation_verdicts` call
              (or a few batches for a large answer): a list of
-             {evidence_id, validated, reasoning} with a one-sentence
-             reasoning each. Cover EVERY evidence row of EVERY claim.
-          5. Reply with a per-claim summary. Be strict: if a span only
+             {evidence_id, validated, reasoning}. Keep each reasoning to
+             ONE SHORT CLAUSE ("span states the outcome verbatim",
+             "figure redacted in source") — verdicts are machine-consumed;
+             prose here is pure cost.
+          5. Reply with ONE LINE per claim:
+             `<sequence>: <n_ok>/<n_rows> ok — <failures, one clause each>`.
+             No prose beyond those lines. Be strict: if a span only
              tangentially relates to the claim, fail it.
 
         Your verdict gates publishing. Do not be lenient — better to

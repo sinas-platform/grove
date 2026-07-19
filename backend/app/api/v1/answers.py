@@ -84,12 +84,18 @@ async def get_answer_claims(
 @router.get("/{answer_id}/evidence", response_model=list[ClaimWithEvidenceOut])
 async def get_answer_evidence(
     answer_id: uuid.UUID,
+    pending_only: bool = False,
     session: AsyncSession = Depends(get_session),
     caller: CallerIdentity = Depends(get_caller),
 ):
     """Every claim of the answer with its evidence rows nested, in claim
     order — the whole evidence set in one call, instead of get_answer_claims
-    plus one get_claim_evidence call per claim."""
+    plus one get_claim_evidence call per claim.
+
+    `pending_only=true` returns only unvalidated evidence rows (claims whose
+    rows are all validated are omitted entirely). A validator should
+    enumerate fully once, then use pending_only for progress re-checks — the
+    response shrinks toward empty instead of re-paying the full payload."""
     await _visible_answer_or_404(answer_id, session, caller)
     claims = (
         await session.execute(
@@ -98,13 +104,14 @@ async def get_answer_evidence(
             .order_by(AnswerClaim.sequence)
         )
     ).scalars().all()
-    evidence = (
-        await session.execute(
-            select(ClaimEvidence)
-            .join(AnswerClaim, AnswerClaim.id == ClaimEvidence.claim_id)
-            .where(AnswerClaim.answer_id == answer_id)
-        )
-    ).scalars().all()
+    ev_stmt = (
+        select(ClaimEvidence)
+        .join(AnswerClaim, AnswerClaim.id == ClaimEvidence.claim_id)
+        .where(AnswerClaim.answer_id == answer_id)
+    )
+    if pending_only:
+        ev_stmt = ev_stmt.where(ClaimEvidence.validated.is_(False))
+    evidence = (await session.execute(ev_stmt)).scalars().all()
     by_claim: dict[uuid.UUID, list[ClaimEvidence]] = {}
     for row in evidence:
         by_claim.setdefault(row.claim_id, []).append(row)
@@ -116,6 +123,7 @@ async def get_answer_evidence(
             ],
         )
         for c in claims
+        if not pending_only or c.id in by_claim
     ]
 
 

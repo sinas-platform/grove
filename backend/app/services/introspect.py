@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from sqlalchemy import TEXT as sql_TEXT
 from sqlalchemy import and_, exists, func, literal_column, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import literal
@@ -283,8 +284,37 @@ async def introspect_with_filter(
                 )
             )
         ).scalars().all()
+
+        # Anti-facet suppression: identifier-like properties (titles, slugs,
+        # urls — nearly one distinct value per document) can never narrow a
+        # set, yet each costs two queries and bloats the payload the agent
+        # re-reads every turn. When the caller didn't name fields explicitly,
+        # skip properties whose values are ~all distinct. One aggregate query
+        # replaces the two-per-property cost of computing their (useless)
+        # distributions. Explicitly requested fields are never skipped.
+        skip_ids: set = set()
+        if not fields and properties:
+            cardinality = (
+                await session.execute(
+                    select(
+                        PropertyValue.property_id,
+                        func.count().label("populated"),
+                        func.count(func.distinct(PropertyValue.value.cast(sql_TEXT))).label("distinct_vals"),
+                    )
+                    .where(
+                        PropertyValue.property_id.in_([p.id for p in properties])
+                    )
+                    .group_by(PropertyValue.property_id)
+                )
+            ).all()
+            for pid, populated, distinct_vals in cardinality:
+                if distinct_vals > 25 and distinct_vals >= 0.9 * populated:
+                    skip_ids.add(pid)
+
         for prop in properties:
             if fields and prop.name not in fields:
+                continue
+            if prop.id in skip_ids:
                 continue
             # Faceted: this field's distribution narrows by ALL other
             # field_filters but NOT by its own — so the user can see other

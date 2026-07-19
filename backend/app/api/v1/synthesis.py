@@ -181,6 +181,65 @@ async def bind_evidence(
     return row
 
 
+class UpdateClaimIn(BaseModel):
+    claim_text: str
+    claim_type: str | None = None
+
+
+@router.patch(
+    "/claims/{claim_id}",
+    response_model=ClaimOut,
+    dependencies=[Depends(require_permission("grove.answers.write:own"))],
+)
+async def update_claim(
+    claim_id: uuid.UUID,
+    payload: UpdateClaimIn,
+    session: AsyncSession = Depends(get_session),
+    caller: CallerIdentity = Depends(get_caller),
+):
+    """Rewrite a claim's text — the remedy when validation shows the claim
+    overreaches what its spans support. Existing evidence stays bound but is
+    reset to unvalidated, since verdicts were judged against the old text."""
+    row = await _writable_claim_or_404(claim_id, session, caller)
+    row.claim_text = payload.claim_text
+    if payload.claim_type is not None:
+        row.claim_type = payload.claim_type
+    from sqlalchemy import update as sa_update
+
+    await session.execute(
+        sa_update(ClaimEvidence)
+        .where(ClaimEvidence.claim_id == claim_id)
+        .values(validated=False, validation_reasoning=None)
+    )
+    await session.commit()
+    await session.refresh(row)
+    return row
+
+
+@router.delete(
+    "/claims/{claim_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_permission("grove.answers.write:own"))],
+)
+async def delete_claim(
+    claim_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    caller: CallerIdentity = Depends(get_caller),
+):
+    """Drop a claim (and its evidence bindings) — the remedy when no span in
+    the corpus can support it, e.g. figures redacted in the source. Removing
+    the claim also unblocks publish_answer, which gates on every remaining
+    row being validated."""
+    row = await _writable_claim_or_404(claim_id, session, caller)
+    from sqlalchemy import delete as sa_delete
+
+    await session.execute(
+        sa_delete(ClaimEvidence).where(ClaimEvidence.claim_id == claim_id)
+    )
+    await session.delete(row)
+    await session.commit()
+
+
 class ValidationVerdict(BaseModel):
     validated: bool
     reasoning: str
