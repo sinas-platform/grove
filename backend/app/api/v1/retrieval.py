@@ -133,8 +133,14 @@ async def add_files_to_result(
     session: AsyncSession = Depends(get_session),
     caller: CallerIdentity = Depends(get_caller),
 ):
-    from app.models import ResultDocument
-    from app.services.result_filter import load_visible_result
+    from datetime import datetime, timezone
+
+    from app.models import ResultDocument, ResultTrace
+    from app.services.result_filter import (
+        AUTO_TRACE_AGENT,
+        _next_trace_sequence,
+        load_visible_result,
+    )
 
     await load_visible_result(session, caller, result_id, for_write=True)
     for did in payload.document_ids:
@@ -146,8 +152,26 @@ async def add_files_to_result(
                 added_by_agent=payload.added_by_agent,
             )
         )
+    # Server-enforced trace — adds were the one document mutation without one
+    # (remove/clear/merge all trace), which let attachments happen silently.
+    next_seq = await _next_trace_sequence(session, result_id)
+    session.add(
+        ResultTrace(
+            result_id=result_id,
+            sequence=next_seq,
+            agent=AUTO_TRACE_AGENT,
+            action="add_files_to_result",
+            parameters={
+                "document_ids": [str(d) for d in payload.document_ids],
+                "reason": payload.reason,
+                "added_by_agent": payload.added_by_agent,
+            },
+            outcome={"added": len(payload.document_ids)},
+            occurred_at=datetime.now(timezone.utc),
+        )
+    )
     await session.commit()
-    return {"added": len(payload.document_ids)}
+    return {"added": len(payload.document_ids), "trace_sequence": next_seq}
 
 
 class MergeResultsIn(BaseModel):
@@ -214,10 +238,66 @@ async def publish_result(
 ):
     from datetime import datetime, timezone
 
-    from app.services.result_filter import load_visible_result
+    from sqlalchemy import select as sa_select
+
+    from app.models import Document, ResultDocument, ResultTrace
+    from app.schemas.runtime import GroveFilter
+    from app.services.introspect import apply_grove_filter
+    from app.services.result_filter import (
+        AUTO_TRACE_AGENT,
+        _next_trace_sequence,
+        load_visible_result,
+    )
+    from app.services.visibility import visible_clause
 
     result = await load_visible_result(session, caller, result_id, for_write=True)
+
+    # Reproducibility metric, recorded at the moment of publication: how much
+    # of the attached set the persisted filter actually reproduces. Explicit
+    # pins (citation-chain includes) are legitimate, but the drift between
+    # "what the filter says" and "what is attached" must be measured and
+    # visible, or the filter degrades into a decorative receipt.
+    attached: set = set(
+        (
+            await session.execute(
+                sa_select(ResultDocument.document_id).where(
+                    ResultDocument.result_id == result_id
+                )
+            )
+        ).scalars()
+    )
+    coverage: float | None = None
+    if attached:
+        f = GroveFilter(**(result.filter or {}))
+        read_all = await caller.has_permission("grove.documents.read:all")
+        stmt = sa_select(Document.id).where(
+            visible_clause(Document, caller, read_all=read_all)
+        )
+        stmt = apply_grove_filter(stmt, f)
+        selected = set((await session.execute(stmt)).scalars())
+        coverage = round(len(attached & selected) / len(attached), 3)
+
+    next_seq = await _next_trace_sequence(session, result_id)
+    session.add(
+        ResultTrace(
+            result_id=result_id,
+            sequence=next_seq,
+            agent=AUTO_TRACE_AGENT,
+            action="publish_result",
+            parameters={},
+            outcome={
+                "attached_documents": len(attached),
+                "filter_coverage": coverage,
+            },
+            occurred_at=datetime.now(timezone.utc),
+        )
+    )
     result.status = "published"
     result.published_at = datetime.now(timezone.utc)
     await session.commit()
-    return {"id": result.id, "status": result.status}
+    return {
+        "id": result.id,
+        "status": result.status,
+        "attached_documents": len(attached),
+        "filter_coverage": coverage,
+    }
