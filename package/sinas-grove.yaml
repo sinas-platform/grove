@@ -9,7 +9,7 @@ metadata:
 
 package:
   name: sinas-grove
-  version: "0.1.19"
+  version: "0.1.20"
   description: >
     Sinas Grove — stateful, multi-agent document indexing and retrieval. The
     runtime is generic; domain knowledge (document classes, properties,
@@ -1231,6 +1231,25 @@ spec:
             in the corpus can support it (e.g. the figure is redacted in the
             source). Removing an unsupportable claim unblocks publishing.
 
+        - name: validate_answer_evidence
+          method: POST
+          path: /api/v1/synthesis/answers/{{ answer_id }}/validate
+          parameters:
+            type: object
+            properties:
+              answer_id: { type: string, format: uuid }
+              pending_only: { type: boolean, default: true }
+            required: [answer_id]
+          description: |
+            Validate the answer's pending evidence rows in ONE call: the
+            server judges every (claim, span) pair in parallel with an
+            independent checker and records the verdicts. Returns
+            {judged, passed, failed:[{claim_sequence, evidence_id,
+            reason}], errors}. Seconds, not minutes — call it after
+            drafting, act on `failed` with the two-strikes rule, then
+            call it again (pending_only) until `failed` and `errors` are
+            empty, and publish.
+
         - name: publish_answer
           method: POST
           path: /api/v1/synthesis/answers/{{ answer_id }}/publish
@@ -1862,7 +1881,13 @@ spec:
                must-keep ones) or to declare the set good enough.
           7. Call `add_files_to_result` with the surviving candidates
              (use `get_result_documents` if you've staged inclusions via
-             explicit_includes already).
+             explicit_includes already). SPAN PROVENANCE: the `reason`
+             you pass must say WHERE the relevance lives — the section
+             heading and approximate lines you confirmed it in (e.g.
+             "§6 counterfactual assessment, ~lines 480-620"). Downstream
+             agents jump straight to that window instead of re-hunting
+             the document; a reason without a location wastes their
+             reads.
           8. Invoke `process-validation-agent` to check the draft
              against the playbook criteria. Pass it the result_id AND
              the EXACT name of the playbook you loaded in your first
@@ -2130,8 +2155,10 @@ spec:
              span (line_from/line_to) of every piece of evidence you
              bind, and spans come from reading, never from summaries.
              BATCH those reads: several parallel `read_document_content`
-             calls in one turn, and use each document's `toc` to fetch
-             the relevant window instead of paging from line 1.
+             calls in one turn. Each attached row's `reason` usually
+             cites the section/lines where the retrieval agent confirmed
+             relevance — read THAT window first; fall back to the `toc`
+             for anything else. Never page a document from line 1.
           5. Draft claims one by one, each WITH its evidence:
                a. Call `draft_claim` with the claim's text, type, and
                   the supporting spans in `evidence` — one call per
@@ -2140,10 +2167,12 @@ spec:
                b. Use `stance: "qualifies"` when the cited span limits
                   the claim, `"contradicts"` only when explicitly
                   presenting contrasting evidence.
-          6. Invoke `faithfulness-validator-agent` on the answer.
-          7. If the validator passes all evidence, call
-             `publish_answer`. Otherwise apply the TWO-STRIKES rule per
-             claim:
+          6. Call `validate_answer_evidence(answer_id)` — the server
+             judges every pending (claim, span) pair in parallel and
+             returns {passed, failed, errors} in seconds. Do NOT invoke
+             a validator agent; this op IS the validation.
+          7. If `failed` and `errors` are empty, call `publish_answer`.
+             Otherwise apply the TWO-STRIKES rule per claim:
                - First failure: EITHER bind one better span via
                  `bind_evidence`, OR weaken the claim with
                  `update_claim` to assert only what the spans actually
@@ -2166,8 +2195,8 @@ spec:
         FINISH THE JOB — two hard rules:
           - Your turn is not over until `publish_answer` has SUCCEEDED.
             A status summary is not a stopping point; if rows are
-            pending, invoke the validator and continue. Only end your
-            turn early to report an unrecoverable error.
+            pending, call `validate_answer_evidence` again and continue.
+            Only end your turn early to report an unrecoverable error.
           - Never abandon an answer to start a fresh one. Fix the
             existing answer in place with `update_claim` /
             `delete_claim` / `bind_evidence` — an abandoned draft
@@ -2183,6 +2212,7 @@ spec:
             - update_claim
             - delete_claim
             - get_answer_evidence
+            - validate_answer_evidence
             - publish_answer
             - get_result
             - get_result_documents
@@ -2191,8 +2221,6 @@ spec:
             - read_document_content
             - list_applicable_playbooks
             - get_playbook
-      enabledAgents:
-        - grove/faithfulness-validator-agent
 
     # ───────── discovery (config auto-suggestion) ─────────
     - namespace: grove
@@ -2371,6 +2399,23 @@ spec:
           operations:
             - list_run_candidates
             - submit_consolidated_proposal
+
+    - namespace: grove
+      name: evidence-check-agent
+      description: Stateless single-span verdict judge, invoked per evidence row by Grove's validate endpoint.
+      llmProviderName: ${{ vars.CHEAP_LLM }}
+      temperature: 0.0
+      systemPrompt: |
+        You judge ONE citation at a time: a claim, a declared stance, and
+        the cited span (with a few lines of margin). Decide strictly
+        whether the span, as written, supports/contradicts/qualifies the
+        claim as declared. A span that only tangentially relates, or that
+        asserts less than the claim does (a claim states a precise figure
+        the span does not contain; a claim generalizes beyond the span's
+        scope), is a FAIL. You have no tools and no memory — everything
+        you need is in the message.
+        Reply with EXACTLY one line and nothing else:
+        PASS — <one short clause>   or   FAIL — <one short clause>
 
     - namespace: grove
       name: faithfulness-validator-agent
