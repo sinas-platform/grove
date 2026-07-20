@@ -1,10 +1,11 @@
 import { NavLink, Outlet } from 'react-router-dom';
-import { Activity, CheckSquare, FileText, MessageSquare, Network, Sparkles } from 'lucide-react';
+import { Activity, CheckSquare, FileText, MessageSquare, Network, Play, Sparkles } from 'lucide-react';
 import { useAuth } from '@/lib/auth';
 
 const links = [
   { to: '/documents', label: 'Documents', icon: FileText },
   { to: '/answers', label: 'Answers', icon: MessageSquare },
+  { to: '/runs', label: 'Runs', icon: Play },
   { to: '/schema', label: 'Schema', icon: Network },
   { to: '/discovery', label: 'Discovery', icon: Sparkles },
   { to: '/review/entities', label: 'Entity review', icon: CheckSquare },
