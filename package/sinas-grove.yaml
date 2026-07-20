@@ -9,7 +9,7 @@ metadata:
 
 package:
   name: sinas-grove
-  version: "0.1.23"
+  version: "0.1.24"
   description: >
     Sinas Grove — stateful, multi-agent document indexing and retrieval. The
     runtime is generic; domain knowledge (document classes, properties,
@@ -1776,7 +1776,7 @@ spec:
       name: search-orchestrator
       description: Decomposes queries; runs deep_search, merges results.
       llmProviderName: ${{ vars.PRIMARY_LLM }}
-      temperature: 0.2
+      temperature: 0.0
       systemPrompt: |
         You orchestrate retrieval for a user query.
 
@@ -1821,7 +1821,7 @@ spec:
       name: deep-search-agent
       description: Runs the introspect-filter-check loop; produces a draft result.
       llmProviderName: ${{ vars.PRIMARY_LLM }}
-      temperature: 0.2
+      temperature: 0.0
       systemPrompt: |
         You retrieve documents for a query by iteratively narrowing
         candidates. You do NOT rely on semantic similarity alone — you
