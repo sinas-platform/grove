@@ -269,10 +269,15 @@ function buildStages(run: QueryRun, activity?: RunActivity, docCount?: number): 
 
 /* --------------------------------- page --------------------------------- */
 
+// Deep-link support: /runs#run=<id>&node=<stage> selects a run (and optionally
+// an inspected stage) on load — useful for sharing a specific run.
+const hashParam = (key: string) =>
+  new URLSearchParams(window.location.hash.slice(1)).get(key);
+
 export default function RunsPage() {
   const qc = useQueryClient();
-  const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [inspected, setInspected] = useState<string | null>(null);
+  const [selectedId, setSelectedId] = useState<string | null>(() => hashParam('run'));
+  const [inspected, setInspected] = useState<string | null>(() => hashParam('node'));
   const [previewDocId, setPreviewDocId] = useState<string | null>(null);
   const [question, setQuestion] = useState('');
   const [mode, setMode] = useState<'retrieval' | 'full'>('retrieval');
