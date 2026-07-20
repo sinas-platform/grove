@@ -101,18 +101,21 @@ class _Sinas:
             r.raise_for_status()
             return r.json().get("reply", "") or ""
 
-    async def chat_last_activity(self, chat_id: str) -> datetime | None:
+    async def chat_messages(self, chat_id: str) -> list[dict]:
         async with httpx.AsyncClient(timeout=30.0) as c:
             r = await c.get(f"{self.base}/chats/{chat_id}", headers=self.headers)
             if r.status_code != 200:
-                return None
-            msgs = r.json().get("messages") or []
-            if not msgs:
-                return None
-            ts = msgs[-1].get("created_at")
-            try:
-                return datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
-            except Exception:
+                return []
+            return r.json().get("messages") or []
+
+    async def chat_last_activity(self, chat_id: str) -> datetime | None:
+        msgs = await self.chat_messages(chat_id)
+        if not msgs:
+            return None
+        ts = msgs[-1].get("created_at")
+        try:
+            return datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        except Exception:
                 return None
 
 
@@ -185,19 +188,52 @@ async def _stage_decompose(run_id: uuid.UUID, sinas: _Sinas) -> list[str]:
     return subs
 
 
-async def _search_result_for(started_iso: str, subquery: str) -> tuple[str, str] | None:
-    frag = subquery[:25]
+_UUID_RE = __import__("re").compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+)
+
+
+async def _search_result_for(
+    sinas: "_Sinas", chat_id: str
+) -> tuple[str, str] | None:
+    """Find the result the deep-search agent published IN THIS CHAT.
+
+    The agent rephrases its result's query, so matching results by query text
+    is unreliable (it silently never matches, and the runner nudges forever).
+    Instead read the chat: create_draft_result / add_files_to_result /
+    publish_result tool calls all carry the result id. Collect the candidate
+    ids from the chat and return the one that is a real, published (or draft)
+    result owned by this run's search — checked against the DB.
+    """
+    ids: list[str] = []
+    for m in await sinas.chat_messages(chat_id):
+        content = m.get("content")
+        if not isinstance(content, str) or "result" not in content.lower():
+            continue
+        for uid in _UUID_RE.findall(content):
+            if uid not in ids:
+                ids.append(uid)
+    if not ids:
+        return None
     async with AsyncSessionLocal() as session:
-        row = (
-            await session.execute(
-                select(Result.id, Result.status)
-                .where(Result.created_at > datetime.fromisoformat(started_iso))
-                .where(Result.query.ilike(f"%{frag}%"))
-                .order_by(Result.created_at.desc())
-                .limit(1)
-            )
-        ).first()
-    return (str(row[0]), row[1]) if row else None
+        rows = {
+            str(r[0]): r[1]
+            for r in (
+                await session.execute(
+                    select(Result.id, Result.status).where(
+                        Result.id.in_([uuid.UUID(i) for i in ids])
+                    )
+                )
+            ).all()
+        }
+    # prefer a published result; else the latest draft the chat created
+    for uid in ids:
+        if rows.get(uid) == "published":
+            return uid, "published"
+    for uid in ids:
+        if uid in rows:
+            return uid, rows[uid]
+    return None
 
 
 async def _stage_search(run_id: uuid.UUID, sinas: _Sinas) -> list[str]:
@@ -230,7 +266,7 @@ async def _stage_search(run_id: uuid.UUID, sinas: _Sinas) -> list[str]:
         for sq, meta in searches.items():
             if meta.get("result_id"):
                 continue
-            found = await _search_result_for(meta["started"], sq)
+            found = await _search_result_for(sinas, meta["chat_id"])
             if found and found[1] == "published":
                 meta["result_id"] = found[0]
                 changed = True
