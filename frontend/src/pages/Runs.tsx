@@ -93,6 +93,87 @@ function stageOf(tel: Record<string, any>, key: string): StageState {
   return t.completed ? 'done' : 'active';
 }
 
+/* ------------------------------- replay masking -------------------------------
+   Replays a finished run by re-deriving the view from progressively unmasked
+   real data: stage telemetry appears at its true relative time (scaled to
+   REPLAY_SECONDS), agent actions and documents stream in across their stage
+   windows. No synthetic data — everything shown is the stored run. */
+
+const REPLAY_SECONDS = 30;
+
+function maskForReplay(
+  run: QueryRun,
+  activity: RunActivity | undefined,
+  docs: ResultDoc[] | undefined,
+  claims: ClaimWithEvidence[] | undefined,
+  t: number, // 0..1 replay progress
+): { run: QueryRun; activity?: RunActivity; docs?: ResultDoc[]; claims?: ClaimWithEvidence[] } {
+  const tel = run.telemetry ?? {};
+  const t0 = Date.parse(tel.decompose?.started ?? run.created_at);
+  const endIso =
+    tel.validate?.published ?? tel.draft?.completed ?? tel.search?.completed ?? run.created_at;
+  const tEnd = Math.max(Date.parse(endIso), t0 + 1);
+  const frac = (iso?: string) => (iso ? Math.min(Math.max((Date.parse(iso) - t0) / (tEnd - t0), 0), 1) : 1);
+
+  const fDecEnd = frac(tel.decompose?.completed);
+  const fSearchEnd = frac(tel.search?.completed);
+  const fDraftEnd = frac(tel.draft?.completed);
+
+  const mTel: Record<string, any> = {};
+  if (tel.decompose) {
+    mTel.decompose = t >= fDecEnd ? tel.decompose : { started: tel.decompose.started, max_fanout: tel.decompose.max_fanout };
+  }
+  if (tel.search && t >= fDecEnd) {
+    mTel.search = t >= fSearchEnd ? tel.search : { started: tel.search.started, results: {} };
+  }
+  if (tel.merge && t >= fSearchEnd) mTel.merge = tel.merge;
+  if (tel.draft && t >= fSearchEnd) {
+    mTel.draft = t >= fDraftEnd ? tel.draft : { started: tel.draft.started };
+  }
+  if (tel.validate && t >= fDraftEnd && t >= 0.97) mTel.validate = tel.validate;
+  mTel._replay_elapsed_s = Math.round((t * (tEnd - t0)) / 1000);
+
+  const searchSpan = Math.max(fSearchEnd - fDecEnd, 0.01);
+  const searchProgress = Math.min(Math.max((t - fDecEnd) / searchSpan, 0), 1);
+  const mActivity: RunActivity | undefined = activity && {
+    searches: activity.searches.map((s) => ({
+      ...s,
+      result_id: t >= fSearchEnd ? s.result_id : null,
+      actions: s.actions.slice(0, Math.floor(s.actions.length * searchProgress)),
+    })),
+    synthesis: activity.synthesis
+      ? {
+          ...activity.synthesis,
+          actions: activity.synthesis.actions.slice(
+            0,
+            Math.floor(
+              activity.synthesis.actions.length *
+                Math.min(Math.max((t - fSearchEnd) / Math.max(fDraftEnd - fSearchEnd, 0.01), 0), 1),
+            ),
+          ),
+        }
+      : null,
+  };
+
+  const mergeReached = t >= fSearchEnd;
+  const mDocs = mergeReached ? docs : docs?.slice(0, Math.floor((docs?.length ?? 0) * searchProgress));
+  const draftProgress = Math.min(Math.max((t - fSearchEnd) / Math.max(fDraftEnd - fSearchEnd, 0.01), 0), 1);
+  const mClaims = t >= 0.97 ? claims : claims?.slice(0, Math.floor((claims?.length ?? 0) * draftProgress));
+
+  return {
+    run: {
+      ...run,
+      status: t >= 1 ? run.status : 'replaying',
+      telemetry: mTel,
+      parent_result_id: run.mode === 'synthesis' || mergeReached ? run.parent_result_id : null,
+      answer_id: t >= 0.97 ? run.answer_id : null,
+    },
+    activity: mActivity,
+    docs: mDocs,
+    claims: mClaims,
+  };
+}
+
 function fmtDuration(start?: string, end?: string): string {
   if (!start) return '';
   const ms = (end ? new Date(end).getTime() : Date.now()) - new Date(start).getTime();
@@ -196,6 +277,7 @@ export default function RunsPage() {
   const [question, setQuestion] = useState('');
   const [mode, setMode] = useState<'retrieval' | 'full'>('retrieval');
   const [effort, setEffort] = useState<'low' | 'medium' | 'high'>('medium');
+  const [replayT, setReplayT] = useState<number | null>(null); // 0..1 while replaying
 
   const runs = useQuery({
     queryKey: ['query-runs'],
@@ -261,14 +343,49 @@ export default function RunsPage() {
     onSuccess: () => qc.invalidateQueries({ queryKey: ['query-run', runId] }),
   });
 
+  const synthesize = useMutation({
+    mutationFn: (from: QueryRun) =>
+      api<QueryRun>('/query-runs', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          question: from.question,
+          mode: 'synthesis',
+          effort: from.effort,
+          parent_result_id: from.parent_result_id,
+        }),
+      }),
+    onSuccess: (created) => {
+      qc.invalidateQueries({ queryKey: ['query-runs'] });
+      setSelectedId(created.id);
+      setInspected(null);
+    },
+  });
+
+  // replay clock
+  const startReplay = () => setReplayT(0);
+  useLayoutEffect(() => {
+    if (replayT === null || replayT >= 1) return;
+    const id = setTimeout(() => setReplayT((v) => (v === null ? null : Math.min(v + 0.2 / REPLAY_SECONDS, 1))), 200);
+    return () => clearTimeout(id);
+  }, [replayT]);
+
+  const view = useMemo(() => {
+    if (run.data && replayT !== null && replayT < 1 && TERMINAL.has(run.data.status)) {
+      return maskForReplay(run.data, activity.data, docs.data, claims.data, replayT);
+    }
+    return { run: run.data ?? undefined, activity: activity.data, docs: docs.data, claims: claims.data };
+  }, [run.data, activity.data, docs.data, claims.data, replayT]);
+
   const graph = useMemo(
-    () => (run.data ? buildStages(run.data, activity.data, docs.data?.length) : null),
-    [run.data, activity.data, docs.data],
+    () => (view.run ? buildStages(view.run, view.activity, view.docs?.length) : null),
+    [view],
   );
 
   const pick = (id: string) => {
     setSelectedId(id);
     setInspected(null);
+    setReplayT(null);
   };
 
   return (
@@ -289,8 +406,8 @@ export default function RunsPage() {
         />
         <select value={mode} onChange={(e) => setMode(e.target.value as any)}
           className="border border-stone-300 rounded-md px-2 py-2 text-sm bg-white text-stone-700">
-          <option value="retrieval">Retrieval</option>
-          <option value="full">Full</option>
+          <option value="retrieval">Retrieve</option>
+          <option value="full">Retrieve + synthesize</option>
         </select>
         <select value={effort} onChange={(e) => setEffort(e.target.value as any)}
           className="border border-stone-300 rounded-md px-2 py-2 text-sm bg-white text-stone-700">
@@ -337,6 +454,25 @@ export default function RunsPage() {
 
         {/* diagram */}
         <div className="w-[340px] shrink-0 bg-white border border-stone-200 rounded-lg p-4">
+          {run.data && TERMINAL.has(run.data.status) && (
+            <div className="flex gap-2 mb-3">
+              <button
+                onClick={startReplay}
+                className="text-xs border border-stone-300 rounded px-2.5 py-1 text-forest-700 hover:border-forest-500 font-medium"
+              >
+                {replayT !== null && replayT < 1 ? 'Replaying…' : '▶ Replay'}
+              </button>
+              {run.data.mode === 'retrieval' && run.data.status === 'published' && run.data.parent_result_id && (
+                <button
+                  onClick={() => synthesize.mutate(run.data!)}
+                  disabled={synthesize.isPending}
+                  className="text-xs border border-stone-300 rounded px-2.5 py-1 text-forest-700 hover:border-forest-500 font-medium disabled:opacity-50"
+                >
+                  {synthesize.isPending ? 'Starting…' : 'Synthesize answer →'}
+                </button>
+              )}
+            </div>
+          )}
           {graph ? (
             <FlowDiagram
               rows={graph.rows}
@@ -351,12 +487,12 @@ export default function RunsPage() {
 
         {/* inspector panel */}
         <div className="flex-1 min-w-0 bg-white border border-stone-200 rounded-lg sticky top-4 max-h-[calc(100vh-120px)] flex flex-col">
-          {run.data && (
+          {view.run && (
             <Inspector
-              run={run.data}
-              activity={activity.data}
-              docs={docs.data}
-              claims={claims.data}
+              run={view.run}
+              activity={view.activity}
+              docs={view.docs}
+              claims={view.claims}
               inspected={inspected}
               onResume={() => resume.mutate()}
               resuming={resume.isPending}
@@ -515,12 +651,15 @@ function Inspector({
   const totalActions =
     (activity?.searches.reduce((n, s) => n + s.actions.length, 0) ?? 0) +
     (activity?.synthesis?.actions.length ?? 0);
-  const elapsed = fmtDuration(
-    tel.decompose?.started ?? run.created_at,
-    run.status === 'published' || run.status === 'failed'
-      ? tel.validate?.published ?? tel.draft?.completed ?? tel.search?.completed
-      : undefined,
-  );
+  const elapsed =
+    tel._replay_elapsed_s != null
+      ? `${Math.floor(tel._replay_elapsed_s / 60)}:${String(tel._replay_elapsed_s % 60).padStart(2, '0')}`
+      : fmtDuration(
+          tel.decompose?.started ?? run.created_at,
+          run.status === 'published' || run.status === 'failed'
+            ? tel.validate?.published ?? tel.draft?.completed ?? tel.search?.completed
+            : undefined,
+        );
 
   const Label = ({ children }: { children: React.ReactNode }) => (
     <div className="text-[10.5px] font-semibold text-stone-400 uppercase tracking-wider mt-4 first:mt-0 mb-1.5">{children}</div>
@@ -708,7 +847,7 @@ function Inspector({
           ['Question', ''],
           ...(run.mode !== 'synthesis'
             ? [
-                ['Plan', tel.decompose?.subqueries ? `${tel.decompose.subqueries.length} sub-searches` : ''],
+                ['Plan', tel.decompose?.subqueries ? `${tel.decompose.subqueries.length} sub-search${tel.decompose.subqueries.length > 1 ? 'es' : ''}` : ''],
                 ...((tel.decompose?.subqueries ?? run.subqueries ?? []) as string[]).map((sq: string, i: number) => {
                   const act = activity?.searches.find((s) => s.subquery === sq);
                   return [`Search ${i + 1}`, act ? `${act.actions.length} actions` : ''];
