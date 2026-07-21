@@ -9,7 +9,7 @@ metadata:
 
 package:
   name: sinas-grove
-  version: "0.1.24"
+  version: "0.1.25"
   description: >
     Sinas Grove — stateful, multi-agent document indexing and retrieval. The
     runtime is generic; domain knowledge (document classes, properties,
@@ -359,6 +359,7 @@ spec:
               version: { type: integer }
               line_from: { type: integer, minimum: 1 }
               line_to: { type: integer, minimum: 1 }
+              numbered: { type: boolean, description: "Prefix every line with its absolute line number. ALWAYS pass true when you will cite spans: copy the visible numbers into line_from/line_to — never count lines yourself." }
             required: [doc_id, version]
           description: |
             Read document content. Returns at most ~500 lines per call to
@@ -2195,6 +2196,10 @@ spec:
              you will actually draw claims from — you need the exact
              span (line_from/line_to) of every piece of evidence you
              bind, and spans come from reading, never from summaries.
+             ALWAYS read with `numbered: true`: every line arrives
+             prefixed with its absolute number, and you cite spans by
+             COPYING those visible numbers. Never count lines yourself —
+             a span whose lines you counted will fail validation.
              BATCH those reads: several parallel `read_document_content`
              calls in one turn. Each attached row's `reason` usually
              cites the section/lines where the retrieval agent confirmed

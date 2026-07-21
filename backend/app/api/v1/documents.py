@@ -205,6 +205,7 @@ async def read_document_content(
     version: int,
     line_from: int | None = Query(default=None, ge=1),
     line_to: int | None = Query(default=None, ge=1),
+    numbered: bool = Query(default=False),
     session: AsyncSession = Depends(get_session),
     caller: CallerIdentity = Depends(get_caller),
 ):
@@ -268,6 +269,16 @@ async def read_document_content(
     else:
         next_line = actual_end_1 + 1
 
+    # With numbered=true every line carries its absolute line number, so a
+    # reader can cite line_from/line_to spans by copying visible numbers,
+    # never by counting (LLM line-counting is unreliable; UI readers keep
+    # the clean text).
+    body = "\n".join(slice_lines)
+    if numbered:
+        body = "\n".join(
+            f"{actual_start_1 + i}│{ln}" for i, ln in enumerate(slice_lines)
+        )
+
     return {
         "document_id": doc_id,
         "version": version,
@@ -277,7 +288,7 @@ async def read_document_content(
         "returned_lines": len(slice_lines),
         "next_line": next_line,
         "is_truncated": next_line is not None,
-        "content": "\n".join(slice_lines),
+        "content": body,
         "extracted": True,
     }
 
