@@ -567,7 +567,20 @@ async def _stage_validate_publish(run_id: uuid.UUID, sinas: _Sinas) -> None:
             MIN_PUBLISH_CLAIMS,
             math.ceil(len(all_claim_ids) * MIN_PUBLISH_FRACTION),
         )
-        if surviving >= floor and failing_ids:
+        if not failing_ids:
+            # The final remediation round left nothing failing (e.g. the
+            # drafter deleted the stubborn claims itself) — the answer is
+            # fully validated; publish it rather than failing on a stale
+            # round budget.
+            from app.models import Answer
+
+            row = await session.get(Answer, answer_id)
+            row.status = "published"
+            row.published_at = _now()
+            await session.commit()
+            await _tele(run_id, "validate", published=_iso())
+            return
+        if surviving >= floor:
             from app.models import Answer
 
             for cid in failing_ids:
