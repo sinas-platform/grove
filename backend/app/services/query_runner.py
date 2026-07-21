@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -40,6 +41,13 @@ DRAFT_TIMEOUT_S = 20 * 60
 IDLE_DEAD_S = 150
 MAX_NUDGES = 2
 MAX_VALIDATE_ROUNDS = 4
+# A round that reduced the failed count earns extra rounds, up to this cap —
+# converging runs finish instead of dying at an arbitrary budget.
+HARD_VALIDATE_ROUNDS = 8
+# Floor for drop-before-fail: publishing after dropping unverifiable claims
+# is allowed only if what survives is still a substantive answer.
+MIN_PUBLISH_CLAIMS = 4
+MIN_PUBLISH_FRACTION = 0.5
 REMEDIATION_WINDOW_S = 8 * 60
 MIN_CLAIMS = 6
 # effort → maximum sub-query fan-out. The bound is enforced here (truncation)
@@ -474,10 +482,21 @@ async def _stage_validate_publish(run_id: uuid.UUID, sinas: _Sinas) -> None:
             await asyncio.sleep(POLL_S)
 
     await _mark(run_id, status="validating")
-    for round_no in range(1, MAX_VALIDATE_ROUNDS + 1):
+    failed_history: list[int] = []
+    round_no = 0
+    while True:
+        round_no += 1
+        # Base budget, extended round by round while the failed count is
+        # strictly shrinking (a converging run finishes; a stalled one stops).
+        if round_no > MAX_VALIDATE_ROUNDS:
+            converging = len(failed_history) >= 2 and failed_history[-1] < failed_history[-2]
+            if round_no > HARD_VALIDATE_ROUNDS or not converging:
+                break
+            await _tele(run_id, "validate", extended_to_round=round_no)
         await _await_chat_quiescence()
         async with AsyncSessionLocal() as session:
             verdict = await validate_answer_evidence(session, caller, answer_id, pending_only=True)
+        failed_history.append(len(verdict["failed"]))
         await _tele(run_id, "validate", **{f"round_{round_no}": {
             "judged": verdict["judged"], "passed": verdict["passed"],
             "failed": len(verdict["failed"]), "errors": len(verdict["errors"]),
@@ -501,8 +520,6 @@ async def _stage_validate_publish(run_id: uuid.UUID, sinas: _Sinas) -> None:
                     await session.commit()
             await _tele(run_id, "validate", published=_iso())
             return
-        if round_no == MAX_VALIDATE_ROUNDS:
-            break
         failures = "\n".join(
             f"- claim seq {f['claim_sequence']} (claim_id {f['claim_id']}, evidence {f['evidence_id']}): {f['reason']}"
             for f in verdict["failed"]
@@ -523,7 +540,58 @@ async def _stage_validate_publish(run_id: uuid.UUID, sinas: _Sinas) -> None:
                 saw_activity = True
             elif saw_activity:
                 break  # worked, then went quiet — remediation done
-    raise RuntimeError("validation did not converge within round budget")
+
+    # Rounds exhausted without convergence. Before failing the run, apply the
+    # drop rule deterministically: remove the claims that still carry
+    # unvalidated evidence and publish what survives — but only if the
+    # surviving answer is still substantive (the completeness floor). A gutted
+    # stub is worse than a visible failure.
+    async with AsyncSessionLocal() as session:
+        all_claim_ids = (
+            await session.execute(
+                select(AnswerClaim.id).where(AnswerClaim.answer_id == answer_id)
+            )
+        ).scalars().all()
+        failing_ids = set(
+            (
+                await session.execute(
+                    select(ClaimEvidence.claim_id)
+                    .join(AnswerClaim, AnswerClaim.id == ClaimEvidence.claim_id)
+                    .where(AnswerClaim.answer_id == answer_id)
+                    .where(ClaimEvidence.validated.is_(False))
+                )
+            ).scalars().all()
+        )
+        surviving = len(all_claim_ids) - len(failing_ids)
+        floor = max(
+            MIN_PUBLISH_CLAIMS,
+            math.ceil(len(all_claim_ids) * MIN_PUBLISH_FRACTION),
+        )
+        if surviving >= floor and failing_ids:
+            from app.models import Answer
+
+            for cid in failing_ids:
+                await session.execute(
+                    ClaimEvidence.__table__.delete().where(ClaimEvidence.claim_id == cid)
+                )
+                await session.execute(
+                    AnswerClaim.__table__.delete().where(AnswerClaim.id == cid)
+                )
+            row = await session.get(Answer, answer_id)
+            row.status = "published"
+            row.published_at = _now()
+            await session.commit()
+            await _tele(
+                run_id, "validate",
+                dropped_claims=len(failing_ids), surviving_claims=surviving,
+                published=_iso(),
+            )
+            return
+    raise RuntimeError(
+        "validation did not converge within round budget "
+        f"(surviving claims {surviving} below completeness floor {floor} — "
+        "refusing to publish a gutted answer)"
+    )
 
 
 # ── entrypoint ──────────────────────────────────────────────────────────────
