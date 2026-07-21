@@ -7,6 +7,7 @@ import LoginPage from './pages/Login';
 import DocumentsPage from './pages/Documents';
 import DocumentDetailPage from './pages/DocumentDetail';
 import AnswersPage from './pages/Answers';
+import RunsPage from './pages/Runs';
 import SchemaPage from './pages/Schema';
 import ActivityPage from './pages/Activity';
 
@@ -47,6 +48,7 @@ export default function App() {
         <Route path="documents" element={<DocumentsPage />} />
         <Route path="documents/:id" element={<DocumentDetailPage />} />
         <Route path="answers" element={<AnswersPage />} />
+        <Route path="runs" element={<RunsPage />} />
         <Route path="schema" element={<SchemaPage />} />
         <Route path="activity" element={<ActivityPage />} />
 
