@@ -137,6 +137,9 @@ def _entity_chunks(content: str) -> list[str]:
 _ENTITY_CHUNK_PROMPT = """Extract EVERY named entity from this document chunk. Reply with ONLY a JSON object, no prose:
 {{"entities": [{{"name": "<most complete name as written>", "type": "<one of: {types}>", "confidence": <0..1>}}]}}
 
+TYPE GUIDANCE (follow exactly):
+{type_guidance}
+
 Be EXHAUSTIVE: every named company, competition authority, court,
 decision/case, legal instrument (treaty articles, acts, regulations),
 jurisdiction and market in the text — including every item of long
@@ -173,6 +176,9 @@ def _front_matter_prompt(
     properties: list[dict] | None,
 ) -> str:
     class_lines = "\n".join(f"- {n}: {d or ''}" for n, d in classes)
+    type_lines = "\n".join(
+        f"- {t['name']}: {t['guidance'][:220]}" for t in entity_types
+    )
     known = ", ".join(sorted(known_entities)[:120]) or "(none)"
     hint = (
         f'\nFilename rule suggests class "{class_hint[0]}" ({class_hint[2]}); '
@@ -195,7 +201,8 @@ def _front_matter_prompt(
 DOCUMENT CLASSES (pick exactly one):
 {class_lines}
 {hint}
-ENTITY TYPES: {", ".join(entity_types)}
+ENTITY TYPES (follow each type's guidance exactly):
+{type_lines}
 
 Entities already recorded for this document (do NOT repeat them):
 {known}
@@ -257,7 +264,7 @@ async def oneshot_ingest_document(
     *,
     gazetteer: list[tuple[str, uuid.UUID, str]],
     classes: list[tuple[uuid.UUID, str, str]],
-    entity_types: dict[str, uuid.UUID],
+    entity_types: list[dict],
     write: bool = True,
 ) -> dict[str, Any]:
     """Run the one-shot path for a single document. Returns a report dict."""
@@ -340,7 +347,7 @@ async def oneshot_ingest_document(
         filename=doc.filename or "",
         content=content,
         classes=[(n, d) for _, n, d in classes],
-        entity_types=list(entity_types),
+        entity_types=entity_types,
         known_entities=[c for c, _ in known.values()],
         class_hint=hint,
         properties=class_props,
@@ -382,7 +389,7 @@ async def oneshot_ingest_document(
                     filename=doc.filename or "",
                     content=content,
                     classes=[(n, d) for _, n, d in classes],
-                    entity_types=list(entity_types),
+                    entity_types=entity_types,
                     known_entities=[c for c, _ in known.values()],
                     class_hint=(cls_name, 1.0, "already classified"),
                     properties=class_props,
@@ -439,7 +446,8 @@ async def oneshot_ingest_document(
         known_names = ", ".join(sorted(c for c, _ in known.values())[:120]) or "(none)"
         chunk_prompts = [
             _ENTITY_CHUNK_PROMPT.format(
-                types=", ".join(entity_types),
+                types=", ".join(t["name"] for t in entity_types),
+                type_guidance="\n".join(f"- {t['name']}: {t['guidance'][:220]}" for t in entity_types),
                 known=known_names,
                 i=i,
                 n=len(chunks),
@@ -488,21 +496,40 @@ async def oneshot_ingest_document(
                     )
                 mentions_added += 1
             continue
-        type_id = entity_types.get(etype)
-        if type_id is None:
+        tinfo = next((t for t in entity_types if t["name"] == etype), None)
+        if tinfo is None or tinfo["creation_mode"] == "closed":
             continue
-        if write:
-            session.add(
-                EntityProposal(
-                    entity_type_id=type_id,
-                    canonical_form=name[:500],
-                    proposing_agent="front-matter-oneshot",
-                    reasoning=f"named in {doc.filename}",
-                    evidence_document_id=document_id,
-                    status="pending",
+        if tinfo["creation_mode"] == "open":
+            # open types: the extractor may create the entity directly
+            if write:
+                new_ent = Entity(
+                    entity_type_id=tinfo["id"], canonical_form=name[:500]
                 )
-            )
-        proposals_added += 1
+                session.add(new_ent)
+                await session.flush()
+                session.add(
+                    EntityMention(
+                        document_id=document_id,
+                        document_version_id=version.id,
+                        entity_id=new_ent.id,
+                        span={"method": "oneshot"},
+                        confidence=float(ent.get("confidence") or 0.8),
+                    )
+                )
+            mentions_added += 1
+        else:  # review
+            if write:
+                session.add(
+                    EntityProposal(
+                        entity_type_id=tinfo["id"],
+                        canonical_form=name[:500],
+                        proposing_agent="front-matter-oneshot",
+                        reasoning=f"named in {doc.filename}",
+                        evidence_document_id=document_id,
+                        status="pending",
+                    )
+                )
+            proposals_added += 1
     report["entity_mentions_llm"] = mentions_added
     report["entity_proposals"] = proposals_added
     report["hallucinations_filtered"] = filtered_out
@@ -534,10 +561,15 @@ async def oneshot_ingest(
             (c.id, c.name, c.description or "")
             for c in (await session.execute(select(DocumentClass))).scalars()
         ]
-        entity_types = {
-            t.name: t.id
+        entity_types = [
+            {
+                "id": t.id,
+                "name": t.name,
+                "guidance": (t.guidance or t.description or "").strip(),
+                "creation_mode": t.creation_mode,
+            }
             for t in (await session.execute(select(EntityType))).scalars()
-        }
+        ]
 
     sem = asyncio.Semaphore(concurrency)
     results: list[dict[str, Any]] = []
