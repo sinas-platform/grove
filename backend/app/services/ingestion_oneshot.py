@@ -114,13 +114,52 @@ def gazetteer_scan(
 
 # ── one-shot LLM pass ──────────────────────────────────────────────────────
 
-_MAX_CONTENT_CHARS = 60_000  # ~15k tokens; longer docs are truncated with a marker
+_MAX_CONTENT_CHARS = 60_000  # front-matter window (class/summary/properties)
+_ENTITY_CHUNK_CHARS = 30_000  # entities are extracted exhaustively per chunk
+_ENTITY_CHUNK_OVERLAP = 1_500
 
 
 def _clip(content: str) -> str:
     if len(content) <= _MAX_CONTENT_CHARS:
         return content
     return content[:_MAX_CONTENT_CHARS] + "\n[... truncated for extraction ...]"
+
+
+def _entity_chunks(content: str) -> list[str]:
+    if len(content) <= _ENTITY_CHUNK_CHARS + _ENTITY_CHUNK_OVERLAP:
+        return [content]
+    return [
+        content[i : i + _ENTITY_CHUNK_CHARS + _ENTITY_CHUNK_OVERLAP]
+        for i in range(0, len(content), _ENTITY_CHUNK_CHARS)
+    ]
+
+
+_ENTITY_CHUNK_PROMPT = """Extract EVERY named entity from this document chunk. Reply with ONLY a JSON object, no prose:
+{{"entities": [{{"name": "<most complete name as written>", "type": "<one of: {types}>", "confidence": <0..1>}}]}}
+
+Be EXHAUSTIVE: every named company, competition authority, court,
+decision/case, legal instrument (treaty articles, acts, regulations),
+jurisdiction and market in the text — including every item of long
+enumerations. Do not invent names; do not stop early; no duplicates.
+Skip entities from this already-recorded list: {known}
+
+CHUNK {i}/{n} OF DOCUMENT {filename}:
+{chunk}"""
+
+
+def _presence_filter(name: str, content_lower: str) -> bool:
+    """Deterministic hallucination guard: an extracted entity must actually
+    occur in the document. Match on the full normalized name or a 3-word
+    prefix (survives 'Authority (ACRONYM)' style tails)."""
+    words = re.sub(r"[^\w\s]", " ", name.lower()).split()
+    if not words:
+        return False
+    for k in (len(words), 4, 3, 2):
+        if k <= len(words):
+            probe = " ".join(words[:k])
+            if len(probe) >= 4 and probe in content_lower:
+                return True
+    return len(words) == 1 and words[0] in content_lower
 
 
 def _front_matter_prompt(
@@ -173,7 +212,9 @@ Reply JSON schema:
 Rules: entities must be REAL named things from the document (companies,
 authorities, courts, decisions/cases, legal instruments, jurisdictions,
 markets) that are NOT in the already-recorded list. Use the most complete
-canonical name the document gives. No duplicates, max 25 entities.
+canonical name the document gives. No duplicates. Be EXHAUSTIVE: list
+every named entity, including every item of long enumerations — do not
+summarize or stop early.
 
 FILENAME: {filename}
 DOCUMENT:
@@ -387,14 +428,49 @@ async def oneshot_ingest_document(
             written_props += 1
     report["properties_written"] = written_props
 
-    # residual entities → mention (known alias) or proposal (new)
+    # residual entities → mention (known alias) or proposal (new).
+    # Long documents get exhaustive per-chunk entity extraction (the
+    # front-matter call's entities only cover its clipped window), and
+    # every candidate must pass the deterministic presence filter.
+    content_lower = content.lower()
+    all_entities: list[dict] = list(data.get("entities") or [])
+    chunks = _entity_chunks(content)
+    if len(chunks) > 1:
+        known_names = ", ".join(sorted(c for c, _ in known.values())[:120]) or "(none)"
+        chunk_prompts = [
+            _ENTITY_CHUNK_PROMPT.format(
+                types=", ".join(entity_types),
+                known=known_names,
+                i=i,
+                n=len(chunks),
+                filename=doc.filename or "",
+                chunk=chunk,
+            )
+            for i, chunk in enumerate(chunks, start=1)
+        ]
+        replies = await asyncio.gather(
+            *(sinas.invoke(FRONT_MATTER_AGENT, p) for p in chunk_prompts)
+        )
+        report["llm_calls"] += len(chunk_prompts)
+        for r in replies:
+            try:
+                all_entities.extend(_parse_json_reply(r).get("entities") or [])
+            except Exception:
+                continue
+
     alias_map = {a: (eid, canon) for a, eid, canon in gazetteer}
     mentions_added = 0
     proposals_added = 0
-    for ent in data.get("entities") or []:
+    filtered_out = 0
+    seen_names: set[str] = set()
+    for ent in all_entities:
         name = str(ent.get("name") or "").strip()
         etype = str(ent.get("type") or "").strip()
-        if not name or len(name) < 3:
+        if not name or len(name) < 3 or name.lower() in seen_names:
+            continue
+        seen_names.add(name.lower())
+        if not _presence_filter(name, content_lower):
+            filtered_out += 1
             continue
         hit = alias_map.get(name.lower())
         if hit:
@@ -429,6 +505,18 @@ async def oneshot_ingest_document(
         proposals_added += 1
     report["entity_mentions_llm"] = mentions_added
     report["entity_proposals"] = proposals_added
+    report["hallucinations_filtered"] = filtered_out
+    report["entity_chunks"] = len(chunks)
+    if not write:  # evaluation mode: expose the full extracted set
+        report["extracted_names"] = sorted(
+            {c for c, _ in known.values()}
+            | {
+                str(e.get("name")).strip()
+                for e in all_entities
+                if str(e.get("name") or "").strip().lower() in seen_names
+                and _presence_filter(str(e.get("name")), content_lower)
+            }
+        )
 
     if write:
         await session.commit()
